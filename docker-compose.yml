@@ -1,0 +1,73 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    networks:
+      - quickfix
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    # Bind to all interfaces but firewall-lock 6379 so only the vast.ai IP
+    # can reach it. The web container hits Redis via the "quickfix" network
+    # using the "redis" hostname — no public exposure needed for web <-> redis.
+    ports:
+      - "0.0.0.0:6379:6379"
+    networks:
+      - quickfix
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+    networks:
+      - quickfix
+
+  worker:
+    build:
+      context: apps/worker
+      dockerfile: Dockerfile.cpu
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - DEVICE=cpu
+      - WORKER_ID=hetzner-cpu-1
+      - SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
+      # Ask PyTorch to use all cores aggressively.
+      - OMP_NUM_THREADS=4
+      - MKL_NUM_THREADS=4
+    depends_on:
+      - redis
+    networks:
+      - quickfix
+
+networks:
+  quickfix:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

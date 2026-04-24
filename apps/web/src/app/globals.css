@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+/* Dark is the default. Light mode activates when html[data-theme="light"]. */
+@theme {
+  --color-bg: #0a0a0b;
+  --color-surface: #14141a;
+  --color-border: #242431;
+  --color-fg: #f4f4f5;
+  --color-muted: #9ca3af;
+  --color-accent: #7c5cff;
+  --color-accent-hover: #9075ff;
+  --color-checker-a: #1f1f28;
+  --color-checker-b: transparent;
+}
+
+/* Light mode overrides — set on the <html> element by the ThemeProvider. */
+:root[data-theme="light"] {
+  --color-bg: #ffffff;
+  --color-surface: #f7f7f8;
+  --color-border: #e4e4e7;
+  --color-fg: #0a0a0b;
+  --color-muted: #6b7280;
+  --color-accent: #7c5cff;
+  --color-accent-hover: #6842ff;
+  --color-checker-a: #e5e7eb;
+  --color-checker-b: #f9fafb;
+}
+
+html, body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  color-scheme: dark;
+  transition: background 150ms ease, color 150ms ease;
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+}
+
+::selection {
+  background: var(--color-accent);
+  color: white;
+}

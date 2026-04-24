@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.env
+.env.local
+.env*.local
+apps/worker/.venv
+apps/worker/__pycache__
+apps/worker/models
+*.log
+.DS_Store
+caddy_data
+caddy_config

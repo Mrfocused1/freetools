@@ -1,0 +1,24 @@
+# Replace quickfix.app with your actual domain before first deploy.
+# Caddy auto-obtains a Let's Encrypt cert on first request.
+{$DOMAIN} {
+    encode zstd gzip
+    reverse_proxy web:3000 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Cap upload size to 25 MB (slightly above the 20 MB app limit to allow for overhead).
+    request_body {
+        max_size 25MB
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Frame-Options "DENY"
+        -Server
+    }
+}
