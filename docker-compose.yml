@@ -21,6 +21,10 @@ services:
       # Leave blank when the GPU worker is not provisioned (returns 503 offline).
       - FONT_GEN_URL=${FONT_GEN_URL:-}
       - FONT_GEN_TOKEN=${FONT_GEN_TOKEN:-}
+      # Used by /api/edit-image to call fal.ai FLUX.1 Kontext.
+      # Get your key at https://fal.ai/dashboard/keys
+      # Leave blank → route returns 503 "service offline" instead of crashing.
+      - FAL_KEY=${FAL_KEY:-}
     depends_on:
       - redis
       - worker
