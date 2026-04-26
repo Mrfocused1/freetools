@@ -33,6 +33,11 @@ from pydantic import BaseModel, HttpUrl
 RESEARCH_TOKEN = os.environ["RESEARCH_TOKEN"]
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng:8888")
 
+# Default upstream LLM (OpenRouter free Gemma 4). Overridable per request.
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemma-3-27b-it:free")
+
 DEFAULT_MAX_ITERATIONS = 8
 DEFAULT_MAX_FETCH_CHARS = 6000
 DEFAULT_MAX_SEARCH_RESULTS = 6
@@ -65,8 +70,10 @@ class GemmaConfig(BaseModel):
 
 class ResearchRequest(BaseModel):
     query: str
-    gemma: GemmaConfig
-    model: str = "google/gemma-4-E4B-it"
+    # Optional per-request LLM override (admin/CLI use). If absent, falls back
+    # to the server-configured LLM_* env vars (default: OpenRouter free Gemma).
+    gemma: GemmaConfig | None = None
+    model: str | None = None
     maxIterations: int = DEFAULT_MAX_ITERATIONS
     maxFetchChars: int = DEFAULT_MAX_FETCH_CHARS
 
@@ -123,15 +130,24 @@ async def tool_fetch(url: str, max_chars: int) -> str:
 
 # ---- Gemma 4 chat completion (OpenAI-compatible via vLLM) --------------
 
-async def gemma_chat(
+async def llm_chat(
     client: httpx.AsyncClient,
-    cfg: GemmaConfig,
+    base_url: str,
+    api_key: str,
     model: str,
     messages: list[dict[str, str]],
 ) -> str:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "content-type": "application/json",
+    }
+    # OpenRouter recommends these headers for analytics/ranking; harmless elsewhere.
+    if "openrouter" in base_url:
+        headers["HTTP-Referer"] = os.environ.get("APP_URL", "https://coachpixel.com")
+        headers["X-Title"] = "Quick Fix Research"
     r = await client.post(
-        f"{cfg.url}/v1/chat/completions",
-        headers={"Authorization": f"Bearer {cfg.token}", "content-type": "application/json"},
+        f"{base_url.rstrip('/')}/chat/completions",
+        headers=headers,
         json={
             "model": model,
             "messages": messages,
@@ -170,7 +186,7 @@ def parse_tool_call(text: str) -> dict[str, Any] | None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "searxng": SEARXNG_URL}
+    return {"ok": True, "searxng": SEARXNG_URL, "default_model": LLM_MODEL}
 
 
 @app.post("/api/research", response_model=ResearchResponse)
@@ -179,6 +195,24 @@ async def research(
     authorization: str | None = Header(None),
 ) -> ResearchResponse:
     _check_auth(authorization)
+
+    # Resolve the upstream LLM: per-request override → env defaults.
+    if req.gemma is not None:
+        base_url = req.gemma.url.rstrip("/")
+        # If the caller didn't include /v1, assume vLLM-style and append it.
+        if not base_url.endswith("/v1"):
+            base_url = base_url + "/v1"
+        api_key = req.gemma.token
+        model = req.model or LLM_MODEL
+    else:
+        if not LLM_API_KEY:
+            raise HTTPException(
+                status_code=503,
+                detail="No LLM configured. Set LLM_API_KEY env var or pass gemma in request.",
+            )
+        base_url = LLM_BASE_URL
+        api_key = LLM_API_KEY
+        model = req.model or LLM_MODEL
 
     trace: list[TraceEntry] = []
     messages = [
@@ -189,9 +223,9 @@ async def research(
     async with httpx.AsyncClient() as client:
         for iteration in range(1, req.maxIterations + 1):
             try:
-                reply = await gemma_chat(client, req.gemma, req.model, messages)
+                reply = await llm_chat(client, base_url, api_key, model, messages)
             except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Gemma call failed: {e}")
+                raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
 
             call = parse_tool_call(reply)
             if not call or "tool" not in call:

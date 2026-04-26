@@ -95,6 +95,12 @@ services:
     environment:
       - SEARXNG_URL=http://searxng:8888
       - RESEARCH_TOKEN=${RESEARCH_TOKEN}
+      # Default LLM upstream (OpenRouter free Gemma 4). Customers don't
+      # provide credentials — the server uses its own key for every request.
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://openrouter.ai/api/v1}
+      - LLM_API_KEY=${OPENROUTER_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-google/gemma-3-27b-it:free}
+      - APP_URL=${APP_URL:-https://coachpixel.com}
     depends_on:
       - searxng
     networks:

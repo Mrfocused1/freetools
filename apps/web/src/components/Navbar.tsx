@@ -20,7 +20,7 @@ export function Navbar() {
             Edit PDF
           </Link>
           <Link href="/research" className="text-[var(--color-muted)] hover:text-[var(--color-fg)]">
-            Research
+            AI Research
           </Link>
           <Link href="/pricing" className="text-[var(--color-muted)] hover:text-[var(--color-fg)]">
             Pricing

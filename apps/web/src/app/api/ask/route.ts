@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { supabaseServer } from "@/lib/supabase/server";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
 
 const RESEARCH_AGENT_URL = process.env.RESEARCH_AGENT_URL ?? "http://research-agent:8000";
@@ -8,10 +7,14 @@ const RESEARCH_TOKEN = process.env.RESEARCH_TOKEN;
 
 const Body = z.object({
   query: z.string().min(2).max(800),
-  gemma: z.object({
-    url: z.string().url(),
-    token: z.string().min(8),
-  }),
+  // Optional admin override: provide a different LLM endpoint per request.
+  // Customers never set this; only the CLI tool uses it for testing.
+  gemma: z
+    .object({
+      url: z.string().url(),
+      token: z.string().min(8),
+    })
+    .optional(),
   model: z.string().min(1).max(120).optional(),
   maxIterations: z.number().int().min(1).max(15).optional(),
 });
@@ -27,20 +30,17 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const sb = await supabaseServer();
-  const {
-    data: { user },
-  } = await sb.auth.getUser();
-  if (!user) return NextResponse.json({ error: "Sign in required" }, { status: 401 });
-
   const ip = getClientIp(req);
+
+  // Per-IP rate limit. Keep it modest since each query fans out to multiple
+  // search/fetch/LLM calls and may consume significant OpenRouter free-tier quota.
   const rl = await rateLimit({
-    scope: `research:${user.id}:${ip}`,
-    limit: 30,
+    scope: `research:${ip}`,
+    limit: 10,
     windowMs: 60_000,
   });
   if (!rl.allowed) {
-    return NextResponse.json({ error: "Rate limit exceeded" }, { status: 429 });
+    return NextResponse.json({ error: "Rate limit exceeded. Try again in a minute." }, { status: 429 });
   }
 
   const parsed = Body.safeParse(await req.json().catch(() => ({})));
