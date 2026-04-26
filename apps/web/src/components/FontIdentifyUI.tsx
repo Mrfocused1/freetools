@@ -51,23 +51,33 @@ function SourceBadge({ source }: { source: string }) {
 // Font preview card                                                             //
 // --------------------------------------------------------------------------- //
 
+/**
+ * Generate a CSS-safe family name unique to this match (so multiple cards
+ * with similar names don't collide in the @font-face registry).
+ */
+function safeFamilyVar(family: string, rank: number): string {
+  const slug = family.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase();
+  return `qfp-${slug}-${rank}`;
+}
+
 function FontCard({ match, rank }: { match: FontMatch; rank: number }) {
   const pct = Math.round(match.score * 100);
-  // Clamp to [0, 100] in case of floating-point overshoot
   const barPct = Math.min(100, Math.max(0, pct));
 
-  // Build a Google Fonts CSS import URL for preview if the source is google.
-  // For other sources we skip the live preview (no reliable CDN).
-  const fontFamilyEncoded = encodeURIComponent(match.family);
-  const previewStyle =
-    match.source === "google"
-      ? {
-          fontFamily: `"${match.family}", sans-serif`,
-        }
-      : {};
+  // Inject a @font-face for any source that gives us a direct TTF URL
+  // (Fontsource CDN, Google's static gstatic URLs, etc.). This makes the
+  // live preview work for every match, not just Google Fonts via @import.
+  const safeName = safeFamilyVar(match.family, rank);
+  const previewUrl = match.previewUrl || match.downloadUrl;
+  const canPreview = !!previewUrl;
+  const fontFaceCss = canPreview
+    ? `@font-face { font-family: '${safeName}'; font-style: normal; font-weight: 400; src: url('${previewUrl}') format('truetype'); font-display: swap; }`
+    : "";
 
   return (
     <article className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-5">
+      {canPreview && <style dangerouslySetInnerHTML={{ __html: fontFaceCss }} />}
+
       {/* Header row */}
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
@@ -97,20 +107,25 @@ function FontCard({ match, rank }: { match: FontMatch; rank: number }) {
         </div>
       </div>
 
-      {/* Font preview (Google Fonts only via CSS API) */}
-      {match.source === "google" && (
-        <>
-          {/* Inject the @import so the font loads */}
-          {/* eslint-disable-next-line @next/next/no-page-custom-font */}
-          <style>{`@import url('https://fonts.googleapis.com/css2?family=${fontFamilyEncoded}:ital,wght@0,400;0,700;1,400&display=swap');`}</style>
-          <div
-            className="mt-4 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-4 py-3 text-lg leading-snug"
-            style={previewStyle}
-            aria-label={`Preview of ${match.family}`}
+      {/* Live preview rendered in the actual font */}
+      {canPreview && (
+        <div
+          className="mt-4 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-4 py-3"
+          aria-label={`Preview of ${match.family}`}
+        >
+          <p
+            className="truncate text-2xl leading-snug text-[var(--color-fg)]"
+            style={{ fontFamily: `'${safeName}', system-ui, sans-serif` }}
           >
-            The quick brown fox jumps over the lazy dog
-          </div>
-        </>
+            Hamburgefonts
+          </p>
+          <p
+            className="mt-1 truncate text-sm text-[var(--color-muted)]"
+            style={{ fontFamily: `'${safeName}', system-ui, sans-serif` }}
+          >
+            The quick brown fox jumps over the lazy dog · 0123456789
+          </p>
+        </div>
       )}
 
       {/* Download button */}
