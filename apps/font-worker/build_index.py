@@ -1,96 +1,66 @@
-#!/usr/bin/env python3
-"""build_index.py — one-time script to build the font CLIP index.
+"""Font index builder — streaming from the Fontsource CDN.
 
-Run this ONCE on the server after first deploy, inside the font-worker container:
+Earlier version cloned google/fonts (~5 GB) and fontsource/font-files (~8 GB)
+to local disk, which exceeded the CX33's 38 GB capacity. This version streams
+each TTF directly from https://cdn.jsdelivr.net/fontsource/fonts (the Fontsource
+package CDN, which mirrors Google Fonts AND Font Squirrel-licensed open fonts
+under a unified naming scheme).
 
+For each font:
+  1. List families from https://api.fontsource.org/v1/fonts (single API call,
+     returns ~2,000 fonts with id/family/weights/styles/license)
+  2. Pick the first available weight from a preference list (400, 700, 300, …)
+  3. Download just that TTF to memory via httpx (~50-300 KB per font)
+  4. Render the sample text with PIL
+  5. Compute CLIP image embedding
+  6. Discard the bytes — never written to disk
+  7. Append to checkpoint every CHECKPOINT_INTERVAL fonts (resumable)
+  8. At the end, write final font_index.npz + font_index.json to /data
+
+Peak disk usage: under 100 MB (just /data + the in-memory checkpoint flush).
+ETA: ~2 hours on a 4-core CPU for ~2,000 fonts.
+
+Run inside the container:
     docker compose run --rm font-worker python build_index.py
-
-Or from the host if you have Python + the same deps installed locally:
-
-    python apps/font-worker/build_index.py
-
-Output (written to /data by default, or $INDEX_DIR):
-  font_index.npz  — numpy array of shape [N, 512] (CLIP embeddings, unit-normed)
-  font_index.json — list of N metadata dicts
-
-Runtime: ~2-4 hours for ~5 000 fonts on a 4-core CPU.
-Memory:  ~2 GB peak (CLIP model + batch processing).
-
-Design decisions
-----------------
-- Google Fonts source: git clone of https://github.com/google/fonts.git (~5 GB).
-  We use a sparse/shallow clone to keep it manageable. Each family lives under
-  ofl/, apache/, ufl/, etc. — we recurse all .ttf/.otf files.
-
-- Fontsource source: git clone of https://github.com/fontsource/font-files.git
-  (~8 GB). This repo mirrors both Google Fonts and Font Squirrel-licensed fonts
-  in a normalized structure. We skip families already found in the Google Fonts
-  clone to avoid duplicates.
-
-  If the Fontsource clone fails (network/disk), we log a warning and continue
-  with Google Fonts only.
-
-- Checkpointing: we write a checkpoint JSON after every CHECKPOINT_INTERVAL
-  fonts so an interrupted run can resume. Re-running the script skips already-
-  embedded fonts (matched by absolute file path).
-
-- CLIP rendering: we render a fixed sample string at 64 px using PIL/freetype,
-  tight-crop, then embed with openai/clip-vit-base-patch32. We embed the
-  *rendered* font image, NOT text — so the search is purely visual.
 """
-
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
-import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------- #
-# Configuration                                                                 #
-# --------------------------------------------------------------------------- #
-
 INDEX_DIR = Path(os.environ.get("INDEX_DIR", "/data"))
-FONT_DIR = Path(os.environ.get("FONT_DIR", "/tmp/fonts"))
-GOOGLE_FONTS_DIR = FONT_DIR / "google-fonts"
-FONTSOURCE_DIR = FONT_DIR / "fontsource"
-
+INDEX_NPZ = INDEX_DIR / "font_index.npz"
+INDEX_JSON = INDEX_DIR / "font_index.json"
 CHECKPOINT_FILE = INDEX_DIR / "build_checkpoint.json"
-OUT_NPZ = INDEX_DIR / "font_index.npz"
-OUT_JSON = INDEX_DIR / "font_index.json"
 
-CHECKPOINT_INTERVAL = 100  # save every N fonts
-
+# Tunables
 SAMPLE_TEXT = "Hamburgefonts ABCDEFG abcdefg 1234"
-RENDER_FONT_SIZE = 64  # px
-RENDER_PADDING = 8     # px around text
-CLIP_EMBED_DIM = 512
+RENDER_FONT_SIZE = 64
+RENDER_PADDING = 16
+WEIGHT_PREFERENCE = [400, 500, 300, 700, 600, 800, 900, 100, 200]
+STYLE_PREFERENCE = ["normal", "italic"]
+SUBSET_PREFERENCE = ["latin", "latin-ext"]
+MAX_FONTS = int(os.environ.get("MAX_FONTS", "0"))  # 0 = no cap
+CHECKPOINT_INTERVAL = 50
+HTTP_TIMEOUT = 30.0
 
-# Google Fonts license-dir → SPDX license identifier
-GOOGLE_LICENSE_MAP = {
-    "ofl": "SIL OFL-1.1",
-    "apache": "Apache-2.0",
-    "ufl": "Ubuntu Font Licence 1.0",
-    "cc-by": "CC BY 4.0",
-}
+FONTSOURCE_LIST_URL = "https://api.fontsource.org/v1/fonts"
+FONTSOURCE_CDN = "https://cdn.jsdelivr.net/fontsource/fonts"
 
-# --------------------------------------------------------------------------- #
-# CLIP helpers                                                                  #
-# --------------------------------------------------------------------------- #
+
+# ---------- CLIP ------------------------------------------------------------ #
 
 _clip_model = None
 _clip_processor = None
@@ -100,331 +70,227 @@ def load_clip() -> None:
     global _clip_model, _clip_processor
     if _clip_model is not None:
         return
-    log.info("Loading CLIP model (first time = ~600 MB download) …")
-    import torch
-    from transformers import CLIPModel, CLIPProcessor
+    log.info("Loading CLIP model openai/clip-vit-base-patch32 …")
+    from transformers import CLIPModel, CLIPProcessor  # noqa: PLC0415
 
     _clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     _clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
     _clip_model.eval()
-    log.info("CLIP ready.")
+    log.info("CLIP model loaded.")
 
 
 def embed_image(img: Image.Image) -> np.ndarray:
     """Return a unit-normed CLIP embedding [512]."""
-    import torch
+    import torch  # noqa: PLC0415
 
     inputs = _clip_processor(images=img, return_tensors="pt")
     with torch.no_grad():
         feats = _clip_model.get_image_features(**inputs)
-    vec = feats[0].cpu().numpy().astype(np.float32)
-    norm = np.linalg.norm(vec)
-    if norm > 0:
-        vec /= norm
-    return vec
+    feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+    return feats.cpu().numpy()[0].astype(np.float32)
 
 
-# --------------------------------------------------------------------------- #
-# Font rendering                                                                #
-# --------------------------------------------------------------------------- #
+# ---------- Font rendering ------------------------------------------------- #
 
 
-def render_sample(font_path: Path) -> Image.Image | None:
-    """Render SAMPLE_TEXT with the given font. Returns None on failure."""
+def render_sample(ttf_bytes: bytes) -> Image.Image | None:
+    """Render SAMPLE_TEXT from in-memory TTF bytes. None on failure."""
     try:
-        font = ImageFont.truetype(str(font_path), size=RENDER_FONT_SIZE)
+        font = ImageFont.truetype(io.BytesIO(ttf_bytes), size=RENDER_FONT_SIZE)
     except Exception:
         return None
-
-    # Measure text size via a temporary draw call
     dummy = Image.new("RGB", (1, 1))
     d = ImageDraw.Draw(dummy)
     try:
         bbox = d.textbbox((0, 0), SAMPLE_TEXT, font=font)
     except Exception:
         return None
-
     w = bbox[2] - bbox[0] + RENDER_PADDING * 2
     h = bbox[3] - bbox[1] + RENDER_PADDING * 2
     if w <= 0 or h <= 0:
         return None
-
     img = Image.new("RGB", (w, h), (255, 255, 255))
     draw = ImageDraw.Draw(img)
     try:
-        draw.text((RENDER_PADDING - bbox[0], RENDER_PADDING - bbox[1]), SAMPLE_TEXT, font=font, fill=(0, 0, 0))
+        draw.text(
+            (RENDER_PADDING - bbox[0], RENDER_PADDING - bbox[1]),
+            SAMPLE_TEXT,
+            font=font,
+            fill=(0, 0, 0),
+        )
     except Exception:
         return None
-
     return img
 
 
-# --------------------------------------------------------------------------- #
-# Checkpoint helpers                                                            #
-# --------------------------------------------------------------------------- #
+# ---------- Checkpoint ----------------------------------------------------- #
 
 
 def load_checkpoint() -> dict[str, Any]:
     if CHECKPOINT_FILE.exists():
-        with open(CHECKPOINT_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {"done_paths": [], "vectors": [], "meta": []}
+        try:
+            with open(CHECKPOINT_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and "done_ids" in d:
+                return d
+        except Exception:
+            log.warning("Checkpoint file unreadable, starting over.")
+    return {"done_ids": [], "vectors": [], "meta": []}
 
 
-def save_checkpoint(done_paths: list[str], vectors: list[list[float]], meta: list[dict]) -> None:
+def save_checkpoint(state: dict[str, Any]) -> None:
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = {
-        "done_paths": done_paths,
-        # We store vectors as lists for JSON serialization; final output uses npz.
-        "vectors": [v.tolist() if isinstance(v, np.ndarray) else v for v in vectors],
-        "meta": meta,
-    }
     with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-        json.dump(tmp, f)
-    log.info("Checkpoint saved (%d fonts).", len(done_paths))
+        json.dump(state, f)
 
 
-# --------------------------------------------------------------------------- #
-# Font discovery                                                                #
-# --------------------------------------------------------------------------- #
+# ---------- Fontsource API ------------------------------------------------- #
 
 
-def _git_clone(url: str, dest: Path, depth: int = 1) -> bool:
-    """Shallow-clone a git repo. Returns True on success."""
-    if dest.exists() and (dest / ".git").exists():
-        log.info("Repo already cloned at %s — skipping clone.", dest)
-        return True
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    log.info("Cloning %s → %s (depth %d) …", url, dest, depth)
-    result = subprocess.run(
-        ["git", "clone", "--depth", str(depth), "--filter=blob:none", url, str(dest)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        log.error("git clone failed:\n%s", result.stderr[:2000])
-        return False
-    log.info("Clone complete: %s", dest)
-    return True
+def fetch_font_list(client: httpx.Client) -> list[dict[str, Any]]:
+    log.info("Fetching font catalog from %s …", FONTSOURCE_LIST_URL)
+    r = client.get(FONTSOURCE_LIST_URL, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    fonts = r.json()
+    log.info("Catalog returned %d fonts.", len(fonts))
+    return fonts
 
 
-def discover_google_fonts() -> list[dict[str, Any]]:
-    """Return a list of font-file records from the Google Fonts git repo."""
-    ok = _git_clone(
-        "https://github.com/google/fonts.git",
-        GOOGLE_FONTS_DIR,
-        depth=1,
-    )
-    if not ok:
-        log.error("Could not clone Google Fonts — skipping.")
-        return []
+def pick_download_url(font: dict[str, Any]) -> tuple[str, int, str, str] | None:
+    """Choose (url, weight, style, subset) for the best representative variant."""
+    weights = [int(w) for w in font.get("weights", []) if str(w).isdigit()]
+    styles = font.get("styles", []) or ["normal"]
+    subsets = font.get("subsets", []) or ["latin"]
+    fid = font.get("id")
+    if not fid or not weights:
+        return None
 
-    records = []
-    # Google Fonts repo layout: <license-dir>/<family>/<variant>.ttf
-    for font_file in GOOGLE_FONTS_DIR.rglob("*.ttf"):
-        parts = font_file.relative_to(GOOGLE_FONTS_DIR).parts
-        if len(parts) < 3:
-            continue
-        license_dir = parts[0]
-        family_dir = parts[1]
-        filename = font_file.stem  # e.g. "Roboto-Regular"
-
-        # Parse style from filename: "FamilyName-Style" or just "FamilyName"
-        if "-" in filename:
-            style = filename.split("-", 1)[1]
-        else:
-            style = "Regular"
-
-        # Family name: convert directory name (kebab/title) → title case
-        family = family_dir.replace("-", " ").replace("_", " ").title()
-
-        license_spdx = GOOGLE_LICENSE_MAP.get(license_dir.lower(), "SIL OFL-1.1")
-
-        records.append(
-            {
-                "path": str(font_file),
-                "family": family,
-                "style": style,
-                "source": "google",
-                "license": license_spdx,
-                "previewUrl": (
-                    f"https://fonts.gstatic.com/s/{family_dir.lower()}/v1/"
-                    f"{font_file.name}"
-                ),
-                "downloadUrl": (
-                    f"https://fonts.google.com/specimen/{family.replace(' ', '+')}"
-                ),
-            }
-        )
-
-    log.info("Discovered %d Google Font variants.", len(records))
-    return records
+    weight = next((w for w in WEIGHT_PREFERENCE if w in weights), weights[0])
+    style = next((s for s in STYLE_PREFERENCE if s in styles), styles[0])
+    subset = next((s for s in SUBSET_PREFERENCE if s in subsets), subsets[0])
+    url = f"{FONTSOURCE_CDN}/{fid}@latest/{subset}-{weight}-{style}.ttf"
+    return url, weight, style, subset
 
 
-def discover_fontsource_fonts(already_families: set[str]) -> list[dict[str, Any]]:
-    """Return font-file records from the Fontsource font-files repo.
-
-    We skip families that already exist in the Google Fonts set to avoid
-    duplicates (Fontsource mirrors many Google Fonts).
-    """
-    ok = _git_clone(
-        "https://github.com/fontsource/font-files.git",
-        FONTSOURCE_DIR,
-        depth=1,
-    )
-    if not ok:
-        log.warning("Could not clone Fontsource — falling back to Google Fonts only.")
-        return []
-
-    records = []
-    # Fontsource layout: fonts/<source>/<family>/<variant>.ttf
-    # sources include 'google', 'other', etc.
-    for font_file in FONTSOURCE_DIR.rglob("*.ttf"):
-        parts = font_file.relative_to(FONTSOURCE_DIR).parts
-        if len(parts) < 3:
-            continue
-
-        # e.g. parts = ("fonts", "other", "open-sans", "open-sans-regular.ttf")
-        source_bucket = parts[1] if len(parts) > 3 else "other"
-
-        # Skip Google Fonts we already have from the Google repo
-        if source_bucket == "google":
-            continue
-
-        family_dir = parts[-2]
-        filename = font_file.stem
-
-        if "-" in filename:
-            style = filename.split("-", 1)[1].replace("-", " ").title()
-        else:
-            style = "Regular"
-
-        family = family_dir.replace("-", " ").replace("_", " ").title()
-
-        # Skip if we already have this family from Google Fonts
-        if family.lower() in already_families:
-            continue
-
-        records.append(
-            {
-                "path": str(font_file),
-                "family": family,
-                "style": style,
-                "source": "fontsource",
-                "license": "SIL OFL-1.1",  # Fontsource only hosts OFL fonts
-                "previewUrl": "",
-                "downloadUrl": (
-                    f"https://fontsource.org/fonts/{family_dir.lower()}"
-                ),
-            }
-        )
-
-    log.info("Discovered %d Fontsource variants (non-Google).", len(records))
-    return records
+def style_name(weight: int, style: str) -> str:
+    weight_name = {
+        100: "Thin", 200: "ExtraLight", 300: "Light", 400: "Regular",
+        500: "Medium", 600: "SemiBold", 700: "Bold", 800: "ExtraBold", 900: "Black",
+    }.get(weight, str(weight))
+    return f"{weight_name}{' Italic' if style == 'italic' else ''}"
 
 
-# --------------------------------------------------------------------------- #
-# Main                                                                          #
-# --------------------------------------------------------------------------- #
+# ---------- Main ----------------------------------------------------------- #
 
 
 def main() -> None:
-    t0 = time.time()
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    state = load_checkpoint()
+    done_ids = set(state["done_ids"])
+    vectors: list[list[float]] = state["vectors"]
+    meta: list[dict] = state["meta"]
+    log.info("Resuming from checkpoint: %d fonts already embedded.", len(done_ids))
 
     load_clip()
 
-    # Load checkpoint (allows resuming interrupted runs)
-    ckpt = load_checkpoint()
-    done_paths: set[str] = set(ckpt["done_paths"])
-    vectors: list[np.ndarray] = [
-        np.array(v, dtype=np.float32) for v in ckpt.get("vectors", [])
-    ]
-    meta: list[dict] = ckpt.get("meta", [])
-    log.info("Resuming from checkpoint: %d fonts already embedded.", len(done_paths))
+    headers = {"User-Agent": "QuickFix-FontIndex/1.0"}
+    started = time.time()
+    success = 0
+    failed = 0
 
-    # Discover all fonts
-    google_records = discover_google_fonts()
-    google_families = {r["family"].lower() for r in google_records}
-    fontsource_records = discover_fontsource_fonts(google_families)
-    all_records = google_records + fontsource_records
+    with httpx.Client(headers=headers, follow_redirects=True) as client:
+        fonts = fetch_font_list(client)
+        if MAX_FONTS:
+            fonts = fonts[:MAX_FONTS]
+            log.info("MAX_FONTS=%d cap applied.", MAX_FONTS)
 
-    # Filter out already-processed paths
-    to_process = [r for r in all_records if r["path"] not in done_paths]
-    log.info(
-        "Total: %d fonts discovered, %d need embedding.",
-        len(all_records),
-        len(to_process),
-    )
+        total = len(fonts)
+        for i, font in enumerate(fonts, 1):
+            fid = font.get("id")
+            if not fid or fid in done_ids:
+                continue
 
-    skipped = 0
-    processed = 0
-    since_ckpt = 0
+            pick = pick_download_url(font)
+            if not pick:
+                failed += 1
+                continue
+            url, weight, style, subset = pick
 
-    for i, record in enumerate(to_process):
-        font_path = Path(record["path"])
+            try:
+                resp = client.get(url, timeout=HTTP_TIMEOUT)
+                if resp.status_code != 200:
+                    log.warning("[%d/%d] %s: HTTP %d for %s", i, total, fid, resp.status_code, url)
+                    failed += 1
+                    done_ids.add(fid)  # don't retry next run
+                    continue
+                ttf_bytes = resp.content
+            except Exception as e:
+                log.warning("[%d/%d] %s: download failed: %s", i, total, fid, e)
+                failed += 1
+                continue
 
-        img = render_sample(font_path)
-        if img is None:
-            skipped += 1
-            if (i + 1) % 500 == 0:
-                log.info("Progress: %d/%d (skipped %d so far)", i + 1, len(to_process), skipped)
-            continue
+            img = render_sample(ttf_bytes)
+            del ttf_bytes  # free memory promptly
+            if img is None:
+                log.warning("[%d/%d] %s: render failed", i, total, fid)
+                failed += 1
+                done_ids.add(fid)
+                continue
 
-        try:
-            vec = embed_image(img)
-        except Exception as exc:
-            log.warning("Embed failed for %s: %s", font_path.name, exc)
-            skipped += 1
-            continue
+            try:
+                vec = embed_image(img)
+            except Exception as e:
+                log.warning("[%d/%d] %s: embed failed: %s", i, total, fid, e)
+                failed += 1
+                continue
 
-        vectors.append(vec)
-        meta.append({k: v for k, v in record.items() if k != "path"})
-        done_paths.add(record["path"])
-        processed += 1
-        since_ckpt += 1
+            vectors.append(vec.tolist())
+            meta.append({
+                "id": fid,
+                "family": font.get("family", fid),
+                "style": style_name(weight, style),
+                "weight": weight,
+                "subset": subset,
+                "source": "fontsource",
+                "category": font.get("category"),
+                "license": (font.get("license") or {}).get("type") or "",
+                "downloadUrl": url,
+                "previewUrl": url,
+                "fontsourceUrl": f"https://fontsource.org/fonts/{fid}",
+            })
+            done_ids.add(fid)
+            success += 1
 
-        if since_ckpt >= CHECKPOINT_INTERVAL:
-            save_checkpoint(list(done_paths), vectors, meta)
-            since_ckpt = 0
-            elapsed = time.time() - t0
-            rate = processed / elapsed if elapsed > 0 else 0
-            remaining = (len(to_process) - i - 1) / max(rate, 1e-9)
-            log.info(
-                "Progress: %d/%d embedded | %.1f fonts/s | ~%.0f min remaining",
-                processed,
-                len(to_process),
-                rate,
-                remaining / 60,
-            )
+            if success % 25 == 0:
+                rate = success / max(1, time.time() - started)
+                eta_min = (total - i) / max(0.1, rate) / 60
+                log.info("[%d/%d] %s — %d ok / %d failed — %.1f fonts/sec — ETA %.0f min",
+                         i, total, fid, success, failed, rate, eta_min)
 
-    # Final save
-    if not vectors:
-        log.error("No fonts were successfully embedded. Check font paths and PIL setup.")
-        sys.exit(1)
+            if success % CHECKPOINT_INTERVAL == 0:
+                save_checkpoint({
+                    "done_ids": list(done_ids),
+                    "vectors": vectors,
+                    "meta": meta,
+                })
 
-    arr = np.stack(vectors, axis=0).astype(np.float32)
-    np.savez_compressed(str(OUT_NPZ), vectors=arr)
-    with open(OUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False)
+    log.info("Embedding pass complete: %d ok, %d failed in %.0fs.",
+             success, failed, time.time() - started)
 
-    elapsed = time.time() - t0
-    log.info(
-        "Done. %d fonts indexed, %d skipped. "
-        "Output: %s (%.1f MB), %s (%.1f MB). Elapsed: %.0f s.",
-        len(meta),
-        skipped,
-        OUT_NPZ,
-        OUT_NPZ.stat().st_size / 1e6,
-        OUT_JSON,
-        OUT_JSON.stat().st_size / 1e6,
-        elapsed,
-    )
+    # Save final outputs
+    save_checkpoint({"done_ids": list(done_ids), "vectors": vectors, "meta": meta})
 
-    # Remove checkpoint now that we have the final output
-    if CHECKPOINT_FILE.exists():
-        CHECKPOINT_FILE.unlink()
-        log.info("Checkpoint file removed.")
+    if vectors:
+        arr = np.asarray(vectors, dtype=np.float32)
+        np.savez_compressed(INDEX_NPZ, vectors=arr)
+        with open(INDEX_JSON, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+        log.info("Wrote %s (%d×%d, %.1f MB) and %s (%d entries).",
+                 INDEX_NPZ, arr.shape[0], arr.shape[1],
+                 INDEX_NPZ.stat().st_size / 1024 / 1024,
+                 INDEX_JSON, len(meta))
+    else:
+        log.error("No vectors built — index not written.")
 
 
 if __name__ == "__main__":
