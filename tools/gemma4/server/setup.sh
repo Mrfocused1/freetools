@@ -16,7 +16,9 @@ export DEBIAN_FRONTEND=noninteractive
 
 echo "[setup] installing system packages..."
 apt-get update -q
-apt-get install -y -q --no-install-recommends git curl ca-certificates
+# build-essential = gcc/g++/make. vLLM's Triton JIT compiles kernels at
+# startup and needs a C compiler — the pytorch:runtime image doesn't ship one.
+apt-get install -y -q --no-install-recommends git curl ca-certificates build-essential
 
 cd /workspace
 
