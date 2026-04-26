@@ -4,7 +4,7 @@ import { rateLimit, getClientIp } from "@/lib/rate-limit";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const FAL_ENDPOINT = "https://fal.run/fal-ai/flux/kontext/dev";
+const FAL_ENDPOINT = "https://fal.run/fal-ai/flux-kontext/dev";
 
 const ALLOWED_TYPES = ["image/png", "image/jpeg", "image/webp"];
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB
