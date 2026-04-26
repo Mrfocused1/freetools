@@ -54,7 +54,7 @@ fi
 
 echo "[*] searching vast.ai for cheapest $GPU with ≥${VRAM}GB VRAM..." >&2
 OFFER=$(vastai search offers \
-  "gpu_name=$GPU num_gpus=1 inet_down>=200 disk_space>=40 cuda_max_good>=12.4 verified=true rentable=true gpu_ram>=$((VRAM * 1024))" \
+  "gpu_name=$GPU num_gpus=1 inet_down>=200 disk_space>=40 cuda_max_good>=12.4 verified=true rentable=true gpu_ram>=$VRAM" \
   --raw 2>/dev/null \
   | jq -r 'sort_by(.dph_total) | .[0].id')
 [ -n "$OFFER" ] && [ "$OFFER" != "null" ] || { echo "no offers found" >&2; exit 3; }
