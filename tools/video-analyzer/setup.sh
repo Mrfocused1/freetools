@@ -22,9 +22,10 @@ cp -r freetools/tools/video-analyzer ./video-analyzer
 cd video-analyzer
 
 echo "[setup] installing python deps..."
-pip install --no-cache-dir -q -r requirements.txt
+pip install --no-cache-dir -q -r requirements.txt hf_transfer
 
 echo "[setup] pre-downloading models (Qwen2.5-VL-7B ~16GB, Whisper large-v3 ~3GB)..."
+export HF_HUB_ENABLE_HF_TRANSFER=1
 python - <<'PY'
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 print("downloading Qwen2.5-VL-7B-Instruct...", flush=True)
