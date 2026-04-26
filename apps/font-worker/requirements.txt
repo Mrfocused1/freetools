@@ -10,3 +10,5 @@ tokenizers>=0.19,<1
 python-multipart==0.0.20
 # optional: faster cosine sim via scipy (falls back to numpy if absent)
 scipy==1.13.1
+# streaming TTF downloads in build_index.py
+httpx==0.27.2
