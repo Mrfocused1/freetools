@@ -13,7 +13,11 @@
 #
 # Base image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
-set -euo pipefail
+set -uo pipefail
+# NB: removed `-e` so that one optional dep failure (e.g. paddlepaddle on a
+# CUDA version mismatch, or MX-Font checkpoint download from flaky Google
+# Drive) does not abort the whole setup. The server can run in degraded
+# modes — outline-only without MX-Font, no OCR without paddle, etc.
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -21,31 +25,34 @@ echo "[setup] installing system packages..."
 apt-get update -q
 apt-get install -y -q --no-install-recommends \
     git curl ca-certificates \
-    build-essential \
+    build-essential pkg-config \
     libfreetype6-dev libfontconfig1 \
-    potrace libpotrace-dev \
+    potrace libpotrace-dev libagg-dev \
     ffmpeg \
-    python3-dev
+    python3-dev \
+    || echo "[setup] WARNING: some apt packages failed — continuing"
 
 # --------------------------------------------------------------------------- #
 # Python dependencies                                                           #
 # --------------------------------------------------------------------------- #
 
-echo "[setup] installing Python deps..."
+echo "[setup] installing Python deps (core required for server start)..."
 pip install --no-cache-dir -q \
     fastapi==0.115.6 \
     "uvicorn[standard]==0.34.0" \
     pillow==10.4.0 \
     numpy==1.26.4 \
     opencv-python-headless==4.10.0.84 \
-    paddlepaddle-gpu==2.6.2 \
-    paddleocr==2.8.1 \
-    pypotrace==0.3 \
     fonttools==4.55.3 \
     python-multipart==0.0.20 \
-    supabase==2.9.0 \
     httpx==0.27.2 \
     hf_transfer
+
+# Optional deps — don't abort if these fail. Server starts in degraded mode.
+echo "[setup] installing optional Python deps (vectorization + OCR + ML)..."
+pip install --no-cache-dir -q pypotrace==0.3 || echo "[setup] WARNING: pypotrace failed — vectorization will use raster fallback"
+pip install --no-cache-dir -q supabase==2.9.0 || echo "[setup] WARNING: supabase failed — TTF returned as base64 instead of upload"
+pip install --no-cache-dir -q paddlepaddle==2.6.2 paddleocr==2.8.1 || echo "[setup] WARNING: paddleocr failed — using positional segmentation only"
 
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
