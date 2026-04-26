@@ -80,7 +80,7 @@ ONSTART="export FONT_GEN_TOKEN='$TOKEN'; \
 curl -fsSL https://raw.githubusercontent.com/Mrfocused1/freetools/main/tools/font-gen/server/setup.sh | bash > /var/log/onstart.log 2>&1"
 
 CREATE=$(vastai create instance "$OFFER" \
-  --image pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime \
+  --image nvcr.io/nvidia/pytorch:24.10-py3 \
   --disk "$DISK" \
   --label "$LABEL" \
   --env "-p 8000:8000 -e FONT_GEN_TOKEN=$TOKEN" \
