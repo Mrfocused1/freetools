@@ -18,16 +18,9 @@ www.{$DOMAIN} {
         }
     }
 
-    # Font Identifier worker (Phase 1: CLIP identification). Token auth is
-    # enforced inside font-worker itself — Caddy just routes the path.
-    @font-clone path /api/font-clone /api/font-clone/*
-    handle @font-clone {
-        reverse_proxy font-worker:8000 {
-            header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
-            header_up X-Forwarded-Proto {scheme}
-        }
-    }
+    # NOTE: /api/font-clone/* is handled by Next.js (which proxies to
+    # font-worker with the bearer token). No direct Caddy → font-worker
+    # route, otherwise the browser request bypasses the auth proxy.
 
     # Everything else → Next.js
     reverse_proxy web:3000 {
