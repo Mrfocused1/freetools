@@ -65,7 +65,7 @@ ONSTART="export API_TOKEN='$TOKEN' HF_TOKEN='$HF_TOKEN' GEMMA_MODEL='$MODEL'; \
 curl -fsSL https://raw.githubusercontent.com/Mrfocused1/freetools/main/tools/gemma4/server/setup.sh | bash > /var/log/onstart.log 2>&1"
 
 CREATE=$(vastai create instance "$OFFER" \
-  --image pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime \
+  --image nvcr.io/nvidia/pytorch:24.10-py3 \
   --disk 40 \
   --label "$LABEL" \
   --env "-p 8000:8000 -e API_TOKEN=$TOKEN -e HF_TOKEN=$HF_TOKEN -e GEMMA_MODEL=$MODEL" \
