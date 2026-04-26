@@ -253,7 +253,8 @@ def main() -> None:
                 "subset": subset,
                 "source": "fontsource",
                 "category": font.get("category"),
-                "license": (font.get("license") or {}).get("type") or "",
+                "license": (font.get("license") if isinstance(font.get("license"), str)
+                            else (font.get("license") or {}).get("type") or ""),
                 "downloadUrl": url,
                 "previewUrl": url,
                 "fontsourceUrl": f"https://fontsource.org/fonts/{fid}",
