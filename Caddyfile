@@ -1,19 +1,34 @@
-# Replace quickfix.app with your actual domain before first deploy.
-# Caddy auto-obtains a Let's Encrypt cert on first request.
+# www → apex redirect
+www.{$DOMAIN} {
+    redir https://{$DOMAIN}{uri} permanent
+}
+
 {$DOMAIN} {
     encode zstd gzip
+
+    # Research-agent endpoint (Gemma 4 + browsing). Token auth is enforced
+    # inside the agent itself via the Authorization header — Caddy just
+    # routes here without rewriting the path.
+    @research path /api/research /api/research/*
+    handle @research {
+        reverse_proxy research-agent:8000 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Everything else → Next.js
     reverse_proxy web:3000 {
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-For {remote_host}
         header_up X-Forwarded-Proto {scheme}
     }
 
-    # Cap upload size to 25 MB (slightly above the 20 MB app limit to allow for overhead).
     request_body {
         max_size 25MB
     }
 
-    # Security headers
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options "nosniff"

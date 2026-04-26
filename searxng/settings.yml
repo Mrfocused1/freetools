@@ -1,0 +1,53 @@
+# Searxng — meta-search engine, internal use only.
+# This config is mounted read-only into the searxng container.
+# The instance is bound to the docker quickfix network only — never
+# exposed publicly.
+
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "Quick Fix research"
+  donation_url: false
+  contact_url: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json   # required so the research-agent can consume results
+
+server:
+  port: 8888
+  bind_address: "0.0.0.0"
+  # Replaced from $SEARXNG_SECRET in docker-compose; never commit a real secret.
+  secret_key: "change-me-via-env"
+  base_url: false
+  image_proxy: false
+  default_http_headers:
+    X-Content-Type-Options: nosniff
+    X-Download-Options: noopen
+    X-Robots-Tag: noindex, nofollow
+    Referrer-Policy: no-referrer
+
+ui:
+  static_use_hash: true
+
+# Limit network surface to common, reliable sources. Add more later via UI/preferences.
+engines:
+  - name: google
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: github
+    disabled: false
+  - name: stackoverflow
+    disabled: false

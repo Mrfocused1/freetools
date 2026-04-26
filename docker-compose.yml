@@ -69,6 +69,35 @@ services:
     networks:
       - quickfix
 
+  # ---- Research stack (Gemma 4 + browsing) ---------------------------
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8888/
+      - SEARXNG_SECRET=${SEARXNG_SECRET}
+      - INSTANCE_NAME=quickfix-research
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    networks:
+      - quickfix
+    # No public ports — internal-only.
+
+  research-agent:
+    build:
+      context: apps/research-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - SEARXNG_URL=http://searxng:8888
+      - RESEARCH_TOKEN=${RESEARCH_TOKEN}
+    depends_on:
+      - searxng
+    networks:
+      - quickfix
+    # Exposed only via Caddy on /api/research with bearer auth.
+
 networks:
   quickfix:
     driver: bridge
