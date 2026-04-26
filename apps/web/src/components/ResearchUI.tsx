@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Toast, useToast } from "./Toast";
 
 type TraceEntry = { action: string; detail: string };
@@ -16,10 +16,27 @@ type State =
     }
   | { kind: "error"; message: string };
 
+const LS_WEB_SEARCH = "quickfix:research:webSearch";
+
 export function ResearchUI() {
   const [state, setState] = useState<State>({ kind: "idle" });
   const [query, setQuery] = useState("");
+  const [webSearch, setWebSearch] = useState(true);
   const toast = useToast();
+
+  // Load saved preference
+  useEffect(() => {
+    const saved = localStorage.getItem(LS_WEB_SEARCH);
+    if (saved !== null) setWebSearch(saved === "true");
+  }, []);
+
+  const toggleWebSearch = useCallback(() => {
+    setWebSearch((v) => {
+      const next = !v;
+      localStorage.setItem(LS_WEB_SEARCH, String(next));
+      return next;
+    });
+  }, []);
 
   const onAsk = useCallback(async () => {
     const q = query.trim();
@@ -29,7 +46,7 @@ export function ResearchUI() {
       const r = await fetch("/api/ask", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: q }),
+        body: JSON.stringify({ query: q, webSearch }),
       });
       if (!r.ok) {
         const err = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
@@ -45,7 +62,7 @@ export function ResearchUI() {
       const msg = e instanceof Error ? e.message : "Request failed";
       setState({ kind: "error", message: msg });
     }
-  }, [query]);
+  }, [query, webSearch]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -66,21 +83,45 @@ export function ResearchUI() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Ask anything — we'll search the web and answer with citations."
+          placeholder={
+            webSearch
+              ? "Ask anything — we'll search the web and answer with citations."
+              : "Chat directly with the model — no web search."
+          }
           rows={3}
           className="w-full resize-none bg-transparent text-base outline-none"
           disabled={isAsking}
         />
-        <div className="mt-2 flex items-center justify-between">
-          <span className="text-xs text-[var(--color-muted)]">
-            {query.length}/800 chars · ⌘/Ctrl + Enter to send
-          </span>
+        <div className="mt-2 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-xs text-[var(--color-muted)]">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={webSearch}
+              onClick={toggleWebSearch}
+              disabled={isAsking}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${
+                webSearch ? "bg-[var(--color-accent)]" : "bg-[var(--color-border)]"
+              } disabled:opacity-50`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition ${
+                  webSearch ? "translate-x-4" : "translate-x-0.5"
+                }`}
+              />
+            </button>
+            <span className="select-none">
+              Web search {webSearch ? "on" : "off"}
+            </span>
+            <span className="opacity-60">·</span>
+            <span>{query.length}/800 · ⌘+Enter</span>
+          </div>
           <button
             onClick={onAsk}
             disabled={isAsking || !query.trim()}
             className="rounded-md bg-[var(--color-accent)] px-4 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50"
           >
-            {isAsking ? "Researching…" : "Ask"}
+            {isAsking ? "Working…" : "Ask"}
           </button>
         </div>
       </div>

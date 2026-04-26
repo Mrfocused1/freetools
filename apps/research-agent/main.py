@@ -42,6 +42,11 @@ DEFAULT_MAX_FETCH_CHARS = 5000
 DEFAULT_MAX_SEARCH_RESULTS = 6
 MAX_CONTEXT_MESSAGES = 18  # cap to keep within model context window
 
+DIRECT_ANSWER_PROMPT = """You are a helpful assistant. Answer the user's question
+directly and concisely from your training knowledge. If you don't know the
+answer or the question requires real-time/current information, say so plainly
+rather than guessing."""
+
 SYSTEM_PROMPT = """You are a research agent. /no_think
 
 For trivial questions (greetings, math, common knowledge that needs no
@@ -75,6 +80,7 @@ class ResearchRequest(BaseModel):
     model: str | None = None
     maxIterations: int = DEFAULT_MAX_ITERATIONS
     maxFetchChars: int = DEFAULT_MAX_FETCH_CHARS
+    webSearch: bool = True  # when False, skip agent loop; just answer directly
 
 
 class TraceEntry(BaseModel):
@@ -283,6 +289,24 @@ async def research(
         model = req.model or LLM_MODEL
 
     trace: list[TraceEntry] = []
+
+    # ---- Direct-answer mode: skip the agent loop entirely. ------------
+    if not req.webSearch:
+        async with httpx.AsyncClient() as client:
+            try:
+                reply = await llm_chat(client, base_url, api_key, model, [
+                    {"role": "system", "content": DIRECT_ANSWER_PROMPT},
+                    {"role": "user", "content": req.query.strip()},
+                ])
+            except Exception as e:
+                detail = str(e)
+                if "429" in detail:
+                    detail = "Upstream LLM rate limit hit even after retries. Try again shortly."
+                raise HTTPException(status_code=502, detail=f"LLM error: {detail}")
+        trace.append(TraceEntry(action="direct_answer", detail=f"len={len(reply)}"))
+        return ResearchResponse(answer=reply.strip(), trace=trace, iterations=1)
+
+    # ---- Research mode: full agent loop with search + fetch. ----------
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": req.query.strip()},

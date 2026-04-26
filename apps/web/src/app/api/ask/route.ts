@@ -7,6 +7,7 @@ const RESEARCH_TOKEN = process.env.RESEARCH_TOKEN;
 
 const Body = z.object({
   query: z.string().min(2).max(800),
+  webSearch: z.boolean().optional(),
   // Optional admin override: provide a different LLM endpoint per request.
   // Customers never set this; only the CLI tool uses it for testing.
   gemma: z
