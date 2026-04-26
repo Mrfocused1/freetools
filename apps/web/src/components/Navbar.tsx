@@ -8,6 +8,7 @@ const NAV_LINKS = [
   { href: "/", label: "Background" },
   { href: "/upscale", label: "Upscale" },
   { href: "/edit-pdf", label: "Edit PDF" },
+  { href: "/font", label: "Font ID" },
   { href: "/research", label: "AI Research" },
   { href: "/pricing", label: "Pricing" },
 ];

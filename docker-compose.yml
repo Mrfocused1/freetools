@@ -13,6 +13,9 @@ services:
       # Used by /api/ask (research UI) to call the research-agent.
       - RESEARCH_AGENT_URL=http://research-agent:8000
       - RESEARCH_TOKEN=${RESEARCH_TOKEN}
+      # Used by /api/font-clone/identify to call the font-worker.
+      - FONT_WORKER_URL=http://font-worker:8000
+      - FONT_TOKEN=${FONT_TOKEN}
     depends_on:
       - redis
       - worker
@@ -107,6 +110,27 @@ services:
       - quickfix
     # Exposed only via Caddy on /api/research with bearer auth.
 
+  # ---- Font Identifier worker (Phase 1: CLIP-based identification) ----------
+  font-worker:
+    build:
+      context: apps/font-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - FONT_TOKEN=${FONT_TOKEN}
+      # HuggingFace model cache — persists the CLIP model across container rebuilds
+      - HF_HOME=/hf_cache
+    volumes:
+      # Font index (font_index.npz + font_index.json) — populate by running:
+      #   docker compose run --rm font-worker python build_index.py
+      - ./font-data:/data
+      # CLIP model cache (~600 MB) — avoids re-downloading on every rebuild
+      - font_hf_cache:/hf_cache
+    # Internal-only; Caddy routes /api/font-clone/* here.
+    networks:
+      - quickfix
+
 networks:
   quickfix:
     driver: bridge
@@ -114,3 +138,5 @@ networks:
 volumes:
   caddy_data:
   caddy_config:
+  # HuggingFace model weights cache for the font-worker
+  font_hf_cache:

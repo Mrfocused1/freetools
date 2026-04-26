@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pillow==10.4.0
+numpy==1.26.4
+# CLIP via transformers (CPU-only; torch installed separately in Dockerfile)
+transformers==4.44.2
+# needed by transformers CLIP processor
+tokenizers>=0.19,<1
+# multipart file uploads
+python-multipart==0.0.20
+# optional: faster cosine sim via scipy (falls back to numpy if absent)
+scipy==1.13.1
