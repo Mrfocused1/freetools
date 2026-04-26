@@ -5,11 +5,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # HuggingFace cache — mounted as a volume in compose for persistence
     HF_HOME=/hf_cache
 
-# System deps: freetype for PIL font rendering, git for build_index.py
+# System deps: freetype for PIL font rendering, git for build_index.py,
+# libgl1 + libglib2.0-0 required by opencv-python-headless on Debian slim
 RUN apt-get update -q && apt-get install -y --no-install-recommends \
     ca-certificates \
     libfreetype6-dev \
     libfontconfig1 \
+    libgl1 \
+    libglib2.0-0 \
     git \
     && rm -rf /var/lib/apt/lists/*
 

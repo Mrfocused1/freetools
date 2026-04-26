@@ -12,3 +12,5 @@ python-multipart==0.0.20
 scipy==1.13.1
 # streaming TTF downloads in build_index.py
 httpx==0.27.2
+# Phase 3: character segmentation via connected components
+opencv-python-headless==4.10.0.84

@@ -1,8 +1,20 @@
-"""Font Identifier worker — Phase 1 (identification only).
+"""Font Identifier worker — Phase 3 (per-character glyph matching).
 
-Receives an uploaded image, extracts the text region using Otsu thresholding,
-computes a CLIP embedding, and returns the top-K closest fonts from a pre-built
-numpy index.
+Phase 3 improvement over Phase 1:
+  - The index stores one CLIP embedding per glyph (A-Z, a-z, 0-9) per font
+    (~62 entries/font) instead of 3 whole-string samples.
+  - At query time we segment the uploaded image into individual character
+    bounding boxes (cv2 connectedComponents), embed each character crop, find
+    its nearest glyph in the index, and aggregate votes by font_id.
+  - The font with the most "winning" characters (highest total similarity mass)
+    is ranked first. This is fundamentally more accurate than string-level
+    matching because CLIP compares like-for-like glyphs.
+
+Backwards compatibility:
+  - The /api/font-clone/identify endpoint contract is unchanged.
+  - The index format (NPZ vectors + JSON meta) is unchanged; only a new "char"
+    field is added per entry. Old indexes without "char" still load fine and the
+    code falls back to the legacy max-score-per-font grouping automatically.
 
 POST /api/font-clone/identify
   Authorization: Bearer <FONT_TOKEN>
@@ -38,7 +50,7 @@ from typing import Any
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageOps
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -52,11 +64,21 @@ TOP_K = 5
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
 RENDER_HEIGHT = 96  # pixels; image is resized to this height before embedding
 
+# Per-character segmentation tunables
+MIN_CHAR_AREA = 20         # ignore blobs smaller than this (noise)
+MAX_CHAR_ASPECT = 8.0      # ignore very wide blobs (likely not single chars)
+GLYPH_CANVAS_SIZE = 80     # square canvas size for individual char crops (matches build_index.py)
+CHAR_PADDING = 4           # px padding around each char bounding box crop
+
+# Voting: for each segmented char, we find its TOP_CHARS_PER_CHAR nearest index
+# entries and add their cosine scores as votes. Using top-N rather than top-1
+# makes the vote more robust to imperfect segmentation.
+TOP_CHARS_PER_CHAR = 3
+
+
 # --------------------------------------------------------------------------- #
 # CLIP model — loaded once at startup                                          #
 # --------------------------------------------------------------------------- #
-# Delay-import torch/transformers so the module can be imported for testing    #
-# without requiring the full ML stack.                                         #
 
 _clip_model = None
 _clip_processor = None
@@ -96,10 +118,11 @@ def _embed_image(img: Image.Image) -> np.ndarray:
 
 _font_vectors: np.ndarray | None = None  # shape [N, 512]
 _font_meta: list[dict[str, Any]] = []
+_index_mode: str = "legacy"  # "glyph" or "legacy"
 
 
 def _load_index() -> None:
-    global _font_vectors, _font_meta
+    global _font_vectors, _font_meta, _index_mode
     if _font_vectors is not None:
         return
     if not INDEX_NPZ.exists() or not INDEX_JSON.exists():
@@ -110,6 +133,7 @@ def _load_index() -> None:
         )
         _font_vectors = np.empty((0, 512), dtype=np.float32)
         _font_meta = []
+        _index_mode = "legacy"
         return
 
     log.info("Loading font index from %s …", INDEX_DIR)
@@ -117,11 +141,18 @@ def _load_index() -> None:
     _font_vectors = data["vectors"].astype(np.float32)
     with open(INDEX_JSON, encoding="utf-8") as f:
         _font_meta = json.load(f)
-    log.info("Loaded %d font variants into memory.", len(_font_meta))
+
+    # Detect index mode: Phase 3 indexes have a "char" field on entries.
+    if _font_meta and "char" in _font_meta[0]:
+        _index_mode = "glyph"
+        log.info("Loaded %d glyph entries (Phase 3 glyph index).", len(_font_meta))
+    else:
+        _index_mode = "legacy"
+        log.info("Loaded %d font variants (legacy Phase 1 index — rebuild recommended).", len(_font_meta))
 
 
 # --------------------------------------------------------------------------- #
-# Image pre-processing                                                         #
+# Image pre-processing (shared)                                                #
 # --------------------------------------------------------------------------- #
 
 
@@ -154,8 +185,6 @@ def _preprocess(raw: bytes) -> Image.Image:
     # invert so text is always dark.
     dark_fraction = np.mean(binary == 0)
     if dark_fraction > 0.5:
-        # More dark pixels than light → text is large/bold or image is inverted;
-        # flip so we always pass dark-text-on-light to CLIP.
         binary = 255 - binary
 
     bin_img = Image.fromarray(binary, mode="L")
@@ -163,10 +192,8 @@ def _preprocess(raw: bytes) -> Image.Image:
     # Tight-crop to bounding box of dark pixels
     bbox = bin_img.getbbox()
     if bbox is None:
-        # Fallback: use the whole image resized
         cropped = img
     else:
-        # Add 4 px padding around the text region
         x0 = max(0, bbox[0] - 4)
         y0 = max(0, bbox[1] - 4)
         x1 = min(bin_img.width, bbox[2] + 4)
@@ -180,8 +207,7 @@ def _preprocess(raw: bytes) -> Image.Image:
     new_w = max(1, int(w * RENDER_HEIGHT / h))
     resized = cropped.resize((new_w, RENDER_HEIGHT), Image.LANCZOS)
 
-    # Pad to a square for CLIP (CLIP expects 224×224; the processor handles that,
-    # but a roughly-square input reduces distortion)
+    # Pad to a square for CLIP
     side = max(new_w, RENDER_HEIGHT)
     canvas = Image.new("RGB", (side, side), (255, 255, 255))
     canvas.paste(resized, ((side - new_w) // 2, (side - RENDER_HEIGHT) // 2))
@@ -190,17 +216,165 @@ def _preprocess(raw: bytes) -> Image.Image:
 
 
 # --------------------------------------------------------------------------- #
+# Character segmentation (Phase 3)                                             #
+# --------------------------------------------------------------------------- #
+
+
+def _segment_chars(raw: bytes) -> list[Image.Image]:
+    """Segment uploaded image into individual character crops using cv2.
+
+    Returns a list of PIL Image crops (one per detected character), centred on
+    a GLYPH_CANVAS_SIZE square canvas — the same framing used in build_index.py.
+
+    Falls back to returning the full preprocessed image in a list if cv2 is not
+    available or segmentation yields fewer than 2 characters.
+    """
+    try:
+        import cv2  # noqa: PLC0415
+    except ImportError:
+        log.debug("cv2 not available; falling back to whole-image embedding.")
+        return [_preprocess(raw)]
+
+    img_pil = Image.open(io.BytesIO(raw)).convert("RGB")
+    gray_pil = ImageOps.grayscale(img_pil)
+    gray_pil = ImageOps.autocontrast(gray_pil, cutoff=2)
+    arr = np.array(gray_pil, dtype=np.uint8)
+
+    # Otsu threshold via cv2 for more robust binarisation
+    _, binary = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+
+    # Ensure text is white on black for connectedComponents
+    dark_fraction = np.mean(binary == 0)
+    if dark_fraction < 0.5:
+        binary = 255 - binary
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+    img_w, img_h = img_pil.size
+    crops: list[Image.Image] = []
+
+    for label in range(1, num_labels):  # skip background (label 0)
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+
+        if area < MIN_CHAR_AREA:
+            continue
+        aspect = max(w, h) / max(min(w, h), 1)
+        if aspect > MAX_CHAR_ASPECT:
+            continue
+        # Discard blobs that are clearly not characters (too small relative to image)
+        if h < img_h * 0.05 or w < img_w * 0.005:
+            continue
+
+        # Crop with padding
+        x0 = max(0, x - CHAR_PADDING)
+        y0 = max(0, y - CHAR_PADDING)
+        x1 = min(img_w, x + w + CHAR_PADDING)
+        y1 = min(img_h, y + h + CHAR_PADDING)
+        char_crop = img_pil.crop((x0, y0, x1, y1))
+
+        # Centre on a square canvas matching the build_index.py format
+        cw, ch = char_crop.size
+        side = max(cw, ch, GLYPH_CANVAS_SIZE)
+        canvas = Image.new("RGB", (side, side), (255, 255, 255))
+        canvas.paste(char_crop, ((side - cw) // 2, (side - ch) // 2))
+
+        crops.append(canvas)
+
+    if len(crops) < 2:
+        # Segmentation failed or image has very few glyphs; fall back to whole image
+        log.debug("Character segmentation yielded %d crops; falling back to whole-image.", len(crops))
+        return [_preprocess(raw)]
+
+    log.debug("Segmented %d character crops.", len(crops))
+    return crops
+
+
+# --------------------------------------------------------------------------- #
+# Voting search (Phase 3 glyph index)                                          #
+# --------------------------------------------------------------------------- #
+
+
+def _search_glyph(char_crops: list[Image.Image]) -> list[tuple[float, int]]:
+    """Embed each char crop, find nearest glyph entries, vote by font_id.
+
+    Returns list of (score, best_meta_idx) sorted by score descending, one per
+    unique font_id (same shape as the legacy _search_legacy output).
+    """
+    assert _font_vectors is not None
+
+    # Accumulate vote scores per font key.
+    # For each character crop, find top-N nearest index entries and add their
+    # cosine similarities as votes. The font_id with the highest total vote wins.
+    vote_score: dict[str, float] = {}
+    vote_meta_idx: dict[str, int] = {}  # track the best-scoring meta entry per font
+
+    for crop in char_crops:
+        try:
+            q = _embed_image(crop)  # [512]
+        except Exception as exc:
+            log.warning("Embed failed for char crop: %s", exc)
+            continue
+
+        sims: np.ndarray = _font_vectors @ q  # [N] cosine similarities
+
+        # Take top-N entries
+        k = min(TOP_CHARS_PER_CHAR, len(sims))
+        top_idxs = np.argpartition(sims, -k)[-k:]
+        top_idxs = top_idxs[np.argsort(-sims[top_idxs])]
+
+        for idx in top_idxs:
+            meta = _font_meta[idx]
+            key = meta.get("id") or f"{meta.get('family','?')}::{meta.get('style','?')}"
+            score = float(sims[idx])
+            vote_score[key] = vote_score.get(key, 0.0) + score
+            # Track the meta entry with the highest individual score for this font
+            if key not in vote_meta_idx or score > float(_font_vectors[vote_meta_idx[key]] @ q):
+                vote_meta_idx[key] = int(idx)
+
+    # Normalise vote scores to [0, 1] by dividing by number of char crops so
+    # the returned "score" field is still roughly cosine-similarity-like.
+    n_crops = max(len(char_crops), 1)
+    ranked = sorted(vote_score.keys(), key=lambda k: vote_score[k], reverse=True)[:TOP_K]
+    return [(vote_score[k] / n_crops, vote_meta_idx[k]) for k in ranked]
+
+
+# --------------------------------------------------------------------------- #
+# Legacy search (Phase 1 index — max cosine per font)                         #
+# --------------------------------------------------------------------------- #
+
+
+def _search_legacy(query_vec: np.ndarray) -> list[tuple[float, int]]:
+    """Original search: max cosine score per (family, style) group."""
+    assert _font_vectors is not None
+    scores: np.ndarray = _font_vectors @ query_vec
+
+    best_by_key: dict[str, tuple[float, int]] = {}
+    for idx in range(len(scores)):
+        meta = _font_meta[idx]
+        key = meta.get("id") or f"{meta.get('family','?')}::{meta.get('style','?')}"
+        s = float(scores[idx])
+        prev = best_by_key.get(key)
+        if prev is None or s > prev[0]:
+            best_by_key[key] = (s, idx)
+
+    ranked = sorted(best_by_key.values(), key=lambda x: x[0], reverse=True)[:TOP_K]
+    return ranked
+
+
+# --------------------------------------------------------------------------- #
 # FastAPI app                                                                  #
 # --------------------------------------------------------------------------- #
 
-app = FastAPI(title="font-worker", version="1.0.0")
+app = FastAPI(title="font-worker", version="3.0.0")
 
 
 @app.on_event("startup")
 async def startup() -> None:
     _load_index()
-    # Pre-load CLIP model so first request is fast.
-    # If the index is empty we still load the model so health checks work.
     try:
         _load_clip()
     except Exception as exc:  # pragma: no cover
@@ -215,7 +389,12 @@ def _check_auth(authorization: str | None) -> None:
 @app.get("/health")
 async def health() -> dict[str, Any]:
     n = len(_font_meta) if _font_meta else 0
-    return {"ok": True, "indexed_fonts": n}
+    # Report unique fonts, not glyph entries, for a meaningful count
+    if _index_mode == "glyph" and _font_meta:
+        unique_fonts = len({m.get("id") for m in _font_meta})
+        return {"ok": True, "indexed_fonts": unique_fonts, "index_mode": _index_mode,
+                "total_glyph_entries": n}
+    return {"ok": True, "indexed_fonts": n, "index_mode": _index_mode}
 
 
 @app.post("/api/font-clone/identify")
@@ -231,16 +410,10 @@ async def identify(
         raise HTTPException(status_code=413, detail="Image too large (max 10 MB)")
 
     try:
-        processed = _preprocess(raw)
+        # Always validate the image is decodeable
+        Image.open(io.BytesIO(raw)).verify()
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Cannot decode image: {exc}") from exc
-
-    # ---- Embed ----------------------------------------------------------- #
-    try:
-        query_vec = _embed_image(processed)  # [512]
-    except Exception as exc:
-        log.exception("CLIP embed failed")
-        raise HTTPException(status_code=500, detail=f"Embedding failed: {exc}") from exc
 
     # ---- Search ---------------------------------------------------------- #
     if _font_vectors is None or len(_font_vectors) == 0:
@@ -252,24 +425,21 @@ async def identify(
             ),
         )
 
-    # Cosine similarity over ALL stored variants (each font has 1+ variants).
-    # We then group by (family, style) and take the MAX score per group so
-    # each unique font appears once and is ranked by its best-matching variant.
-    scores: np.ndarray = _font_vectors @ query_vec  # dot product = cosine sim
+    try:
+        if _index_mode == "glyph":
+            # Phase 3: segment chars, embed each, vote by font_id
+            char_crops = _segment_chars(raw)
+            ranked = _search_glyph(char_crops)
+        else:
+            # Legacy Phase 1: whole-image embed + max cosine per font
+            processed = _preprocess(raw)
+            query_vec = _embed_image(processed)
+            ranked = _search_legacy(query_vec)
+    except Exception as exc:
+        log.exception("Search failed")
+        raise HTTPException(status_code=500, detail=f"Search failed: {exc}") from exc
 
-    best_by_key: dict[str, tuple[float, int]] = {}
-    for idx in range(len(scores)):
-        meta = _font_meta[idx]
-        # Stable per-font key (id includes the family). Fall back to family+style.
-        key = meta.get("id") or f"{meta.get('family','?')}::{meta.get('style','?')}"
-        s = float(scores[idx])
-        prev = best_by_key.get(key)
-        if prev is None or s > prev[0]:
-            best_by_key[key] = (s, idx)
-
-    # Sort groups by best-variant score, take top-K
-    ranked = sorted(best_by_key.values(), key=lambda x: x[0], reverse=True)[:TOP_K]
-
+    # ---- Format response ------------------------------------------------- #
     matches = []
     for score, idx in ranked:
         meta = _font_meta[idx]
@@ -279,7 +449,7 @@ async def identify(
                 "style": meta.get("style", "Regular"),
                 "source": meta.get("source", "unknown"),
                 "license": meta.get("license", ""),
-                "score": round(score, 4),
+                "score": round(float(score), 4),
                 "previewUrl": meta.get("previewUrl", ""),
                 "downloadUrl": meta.get("downloadUrl", ""),
             }

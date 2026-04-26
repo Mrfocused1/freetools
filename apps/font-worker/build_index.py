@@ -1,24 +1,33 @@
-"""Font index builder — streaming from the Fontsource CDN.
+"""Font index builder — per-character glyph embeddings (Phase 3).
 
-Earlier version cloned google/fonts (~5 GB) and fontsource/font-files (~8 GB)
-to local disk, which exceeded the CX33's 38 GB capacity. This version streams
-each TTF directly from https://cdn.jsdelivr.net/fontsource/fonts (the Fontsource
-package CDN, which mirrors Google Fonts AND Font Squirrel-licensed open fonts
-under a unified naming scheme).
+Phase 3 improvement: instead of embedding 3 whole-string samples per font,
+we embed individual glyphs (A-Z, a-z, 0-9 = 62 characters) at 64px each.
+This gives CLIP like-for-like comparisons at query time — the 'g' glyph in
+the user's image is compared against the 'g' glyph in the index, which is
+far more discriminative than comparing whole strings where font-category
+signals dominate over within-category details.
+
+Index size: ~2,000 fonts × 62 chars = ~124,000 entries × 512 floats × 4 bytes
+            ≈ 254 MB (compressed). Well within the 500 MB budget.
+
+Query strategy (in main.py):
+  1. Segment user image into character bounding boxes via cv2 connectedComponents.
+  2. Embed each character crop.
+  3. Find nearest-neighbour glyph in the index.
+  4. Aggregate votes by font_id; top-scoring font wins.
 
 For each font:
-  1. List families from https://api.fontsource.org/v1/fonts (single API call,
-     returns ~2,000 fonts with id/family/weights/styles/license)
+  1. List families from https://api.fontsource.org/v1/fonts
   2. Pick the first available weight from a preference list (400, 700, 300, …)
   3. Download just that TTF to memory via httpx (~50-300 KB per font)
-  4. Render the sample text with PIL
-  5. Compute CLIP image embedding
+  4. Render each of the 62 glyphs individually with PIL at RENDER_FONT_SIZE
+  5. Compute CLIP image embedding per glyph
   6. Discard the bytes — never written to disk
   7. Append to checkpoint every CHECKPOINT_INTERVAL fonts (resumable)
   8. At the end, write final font_index.npz + font_index.json to /data
 
 Peak disk usage: under 100 MB (just /data + the in-memory checkpoint flush).
-ETA: ~2 hours on a 4-core CPU for ~2,000 fonts.
+ETA: ~3-4 hours on a 4-core CPU for ~2,000 fonts (62 embeds/font vs. 3 before).
 
 Run inside the container:
     docker compose run --rm font-worker python build_index.py
@@ -29,6 +38,7 @@ import io
 import json
 import logging
 import os
+import string
 import time
 from pathlib import Path
 from typing import Any
@@ -45,19 +55,14 @@ INDEX_NPZ = INDEX_DIR / "font_index.npz"
 INDEX_JSON = INDEX_DIR / "font_index.json"
 CHECKPOINT_FILE = INDEX_DIR / "build_checkpoint.json"
 
-# Tunables
-# We embed each font under several text variants so that at query time we can
-# match against whichever variant is most similar to the user's input
-# (lowercase-only? all caps? mixed?). Per-variant similarity is later max'd
-# per-font in main.py, which dramatically improves match quality vs a single
-# fixed sample text.
-SAMPLE_TEXTS = [
-    "Hamburgefonts ABCDEFG abcdefg 1234",  # mixed pangram-like
-    "abcdefghijklmnopqrstuvwxyz",          # full lowercase
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",          # full uppercase
-]
-RENDER_FONT_SIZE = 64
-RENDER_PADDING = 16
+# Per-character glyph set: A-Z, a-z, 0-9
+GLYPH_CHARS: list[str] = list(string.ascii_uppercase + string.ascii_lowercase + string.digits)
+# 62 characters total
+
+RENDER_FONT_SIZE = 64   # px — same as Phase 2 for consistency
+RENDER_PADDING = 8      # smaller padding since glyphs are compact
+GLYPH_CANVAS_SIZE = 80  # render on a fixed 80×80 canvas before passing to CLIP
+
 WEIGHT_PREFERENCE = [400, 500, 300, 700, 600, 800, 900, 100, 200]
 STYLE_PREFERENCE = ["normal", "italic"]
 SUBSET_PREFERENCE = ["latin", "latin-ext"]
@@ -102,8 +107,12 @@ def embed_image(img: Image.Image) -> np.ndarray:
 # ---------- Font rendering ------------------------------------------------- #
 
 
-def render_sample(ttf_bytes: bytes, sample_text: str) -> Image.Image | None:
-    """Render `sample_text` from in-memory TTF bytes. None on failure."""
+def render_glyph(ttf_bytes: bytes, char: str) -> Image.Image | None:
+    """Render a single character on a square white canvas. Returns None on failure.
+
+    The character is rendered centred on a GLYPH_CANVAS_SIZE × GLYPH_CANVAS_SIZE
+    white canvas so CLIP sees consistent framing regardless of glyph width.
+    """
     try:
         font = ImageFont.truetype(io.BytesIO(ttf_bytes), size=RENDER_FONT_SIZE)
     except Exception:
@@ -111,25 +120,29 @@ def render_sample(ttf_bytes: bytes, sample_text: str) -> Image.Image | None:
     dummy = Image.new("RGB", (1, 1))
     d = ImageDraw.Draw(dummy)
     try:
-        bbox = d.textbbox((0, 0), sample_text, font=font)
+        bbox = d.textbbox((0, 0), char, font=font)
     except Exception:
         return None
-    w = bbox[2] - bbox[0] + RENDER_PADDING * 2
-    h = bbox[3] - bbox[1] + RENDER_PADDING * 2
-    if w <= 0 or h <= 0:
+
+    glyph_w = bbox[2] - bbox[0]
+    glyph_h = bbox[3] - bbox[1]
+    if glyph_w <= 0 or glyph_h <= 0:
         return None
-    img = Image.new("RGB", (w, h), (255, 255, 255))
-    draw = ImageDraw.Draw(img)
+
+    # Build a square canvas sized to contain the glyph with padding
+    side = max(glyph_w, glyph_h) + RENDER_PADDING * 2
+    side = max(side, GLYPH_CANVAS_SIZE)  # never smaller than GLYPH_CANVAS_SIZE
+    canvas = Image.new("RGB", (side, side), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    # Centre the glyph on the canvas
+    x = (side - glyph_w) // 2 - bbox[0]
+    y = (side - glyph_h) // 2 - bbox[1]
     try:
-        draw.text(
-            (RENDER_PADDING - bbox[0], RENDER_PADDING - bbox[1]),
-            sample_text,
-            font=font,
-            fill=(0, 0, 0),
-        )
+        draw.text((x, y), char, font=font, fill=(0, 0, 0))
     except Exception:
         return None
-    return img
+    return canvas
 
 
 # ---------- Checkpoint ----------------------------------------------------- #
@@ -199,6 +212,7 @@ def main() -> None:
     vectors: list[list[float]] = state["vectors"]
     meta: list[dict] = state["meta"]
     log.info("Resuming from checkpoint: %d fonts already embedded.", len(done_ids))
+    log.info("Glyph set: %d characters per font (%s…)", len(GLYPH_CHARS), GLYPH_CHARS[:8])
 
     load_clip()
 
@@ -238,40 +252,41 @@ def main() -> None:
                 failed += 1
                 continue
 
-            # Render + embed for each sample text variant. We store them as
-            # separate entries; main.py groups by `id` and takes the max score
-            # per font at query time, so the best-matching variant wins.
+            # Render + embed each glyph individually. Each glyph is stored as a
+            # separate index entry tagged with (font_id, char). At query time,
+            # main.py segments the user image into character bounding boxes, embeds
+            # each one, finds the nearest glyph, and votes by font_id.
             font_vecs: list[list[float]] = []
             font_metas: list[dict] = []
-            for variant_idx, sample_text in enumerate(SAMPLE_TEXTS):
-                img = render_sample(ttf_bytes, sample_text)
+            base_meta = {
+                "id": fid,
+                "family": font.get("family", fid),
+                "style": style_name(weight, style),
+                "weight": weight,
+                "subset": subset,
+                "source": "fontsource",
+                "category": font.get("category"),
+                "license": (font.get("license") if isinstance(font.get("license"), str)
+                            else (font.get("license") or {}).get("type") or ""),
+                "downloadUrl": url,
+                "previewUrl": url,
+                "fontsourceUrl": f"https://fontsource.org/fonts/{fid}",
+            }
+            for char in GLYPH_CHARS:
+                img = render_glyph(ttf_bytes, char)
                 if img is None:
                     continue
                 try:
                     vec = embed_image(img)
                 except Exception as e:
-                    log.warning("[%d/%d] %s variant=%d: embed failed: %s", i, total, fid, variant_idx, e)
+                    log.warning("[%d/%d] %s char=%r: embed failed: %s", i, total, fid, char, e)
                     continue
                 font_vecs.append(vec.tolist())
-                font_metas.append({
-                    "id": fid,
-                    "family": font.get("family", fid),
-                    "style": style_name(weight, style),
-                    "weight": weight,
-                    "subset": subset,
-                    "variant": variant_idx,
-                    "source": "fontsource",
-                    "category": font.get("category"),
-                    "license": (font.get("license") if isinstance(font.get("license"), str)
-                                else (font.get("license") or {}).get("type") or ""),
-                    "downloadUrl": url,
-                    "previewUrl": url,
-                    "fontsourceUrl": f"https://fontsource.org/fonts/{fid}",
-                })
+                font_metas.append({**base_meta, "char": char})
             del ttf_bytes  # free memory promptly
 
             if not font_vecs:
-                log.warning("[%d/%d] %s: all variants failed to render", i, total, fid)
+                log.warning("[%d/%d] %s: all glyphs failed to render", i, total, fid)
                 failed += 1
                 done_ids.add(fid)
                 continue
