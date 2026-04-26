@@ -10,6 +10,9 @@ services:
       # Used by the synchronous PDF-edit endpoints to call the worker over
       # the internal docker network (no public exposure needed).
       - WORKER_URL=http://worker:8000
+      # Used by /api/ask (research UI) to call the research-agent.
+      - RESEARCH_AGENT_URL=http://research-agent:8000
+      - RESEARCH_TOKEN=${RESEARCH_TOKEN}
     depends_on:
       - redis
       - worker
