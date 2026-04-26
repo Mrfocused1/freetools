@@ -19,3 +19,6 @@ uvicorn[standard]==0.30.6
 
 # Utility
 tqdm==4.66.5
+
+# PDF editing (text extraction + redaction + re-rendering)
+PyMuPDF==1.24.10

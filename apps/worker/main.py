@@ -18,10 +18,12 @@ from typing import Any
 import httpx
 import redis.asyncio as redis_async
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 from inference import InferenceEngine, ModelName
 from upscaler import UpscaleEngine
+import pdf_edit
 
 load_dotenv()
 
@@ -349,6 +351,93 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 async def health():
     return {"ok": True, "worker": WORKER_ID, "device": engine.device}
+
+
+# ---- PDF text editing (synchronous CPU endpoints) -----------------------
+#
+# Unlike bg-remove/upscale which go through Redis for batching, PDF parse
+# and apply are interactive: the user is waiting in the editor. We expose
+# them as direct HTTP endpoints, called from the Next.js app via the
+# internal docker network.
+
+
+class PdfParseRequest(BaseModel):
+    inputPath: str  # storage path, e.g. "pdfs/<sessionId>/original.pdf"
+
+
+class PdfEditItem(BaseModel):
+    pageNumber: int
+    blockId: str
+    newText: str
+
+
+class PdfApplyRequest(BaseModel):
+    inputPath: str
+    edits: list[PdfEditItem]
+
+
+async def _fetch_pdf_bytes(client: httpx.AsyncClient, path: str) -> bytes:
+    return await fetch_input(client, path)
+
+
+async def _upload_pdf_bytes(client: httpx.AsyncClient, path: str, data: bytes) -> None:
+    url = f"{SUPABASE_URL}/storage/v1/object/images/{path}"
+    r = await client.post(
+        url,
+        headers={
+            "apikey": SUPABASE_KEY,
+            "authorization": f"Bearer {SUPABASE_KEY}",
+            "content-type": "application/pdf",
+            "x-upsert": "true",
+        },
+        content=data,
+        timeout=120.0,
+    )
+    r.raise_for_status()
+
+
+@app.post("/pdf/parse")
+async def pdf_parse(req: PdfParseRequest):
+    async with httpx.AsyncClient() as client:
+        try:
+            pdf_bytes = await _fetch_pdf_bytes(client, req.inputPath)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"could not fetch PDF: {e}")
+    try:
+        result = await asyncio.to_thread(pdf_edit.parse_pdf, pdf_bytes)
+    except Exception as e:
+        log("pdf.parse.error", error=str(e), input=req.inputPath)
+        raise HTTPException(status_code=400, detail=str(e))
+    log("pdf.parse.ok", input=req.inputPath, pages=result["pageCount"])
+    return result
+
+
+@app.post("/pdf/apply")
+async def pdf_apply(req: PdfApplyRequest):
+    async with httpx.AsyncClient() as client:
+        try:
+            pdf_bytes = await _fetch_pdf_bytes(client, req.inputPath)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"could not fetch PDF: {e}")
+
+        edits_dict = [e.model_dump() for e in req.edits]
+        try:
+            edited = await asyncio.to_thread(pdf_edit.apply_edits, pdf_bytes, edits_dict)
+        except Exception as e:
+            log("pdf.apply.error", error=str(e), input=req.inputPath)
+            raise HTTPException(status_code=400, detail=str(e))
+
+        # Save under same session prefix.
+        prefix = req.inputPath.rsplit("/", 1)[0]
+        out_path = f"{prefix}/edited.pdf"
+        try:
+            await _upload_pdf_bytes(client, out_path, edited)
+        except Exception as e:
+            log("pdf.apply.upload_error", error=str(e))
+            raise HTTPException(status_code=500, detail=f"upload failed: {e}")
+
+        log("pdf.apply.ok", input=req.inputPath, output=out_path, edits=len(edits_dict))
+        return {"outputPath": out_path}
 
 
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop):

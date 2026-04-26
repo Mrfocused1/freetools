@@ -16,6 +16,9 @@ export function Navbar() {
           <Link href="/upscale" className="text-[var(--color-muted)] hover:text-[var(--color-fg)]">
             Upscale
           </Link>
+          <Link href="/edit-pdf" className="text-[var(--color-muted)] hover:text-[var(--color-fg)]">
+            Edit PDF
+          </Link>
           <Link href="/pricing" className="text-[var(--color-muted)] hover:text-[var(--color-fg)]">
             Pricing
           </Link>

@@ -6,8 +6,13 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # Used by the synchronous PDF-edit endpoints to call the worker over
+      # the internal docker network (no public exposure needed).
+      - WORKER_URL=http://worker:8000
     depends_on:
       - redis
+      - worker
     networks:
       - quickfix
 
