@@ -42,24 +42,27 @@ DEFAULT_MAX_ITERATIONS = 8
 DEFAULT_MAX_FETCH_CHARS = 6000
 DEFAULT_MAX_SEARCH_RESULTS = 6
 
-SYSTEM_PROMPT = """You are a research agent. You answer the user's question by
-iteratively using tools, then producing a final answer with citations.
+SYSTEM_PROMPT = """You are a research agent.
+
+If the question is trivial (greetings, math, common knowledge that doesn't need
+verification), answer immediately with the answer tool — do NOT search.
+Use search/fetch only when the answer genuinely requires up-to-date or
+specialized web information.
 
 Available tools (you may call ONE per turn):
 
 - search(query: str) — search the web; returns a list of {title, url, snippet}.
 - fetch(url: str) — fetch the content of a URL as readable markdown.
-- answer(text: str) — your final answer, with inline citations like [1], [2]
-  matching the URLs you fetched.
+- answer(text: str) — your final answer; include inline citations like [1], [2]
+  when you used fetched sources.
 
 You MUST respond with a single JSON object on each turn, no prose, in this shape:
 {"tool": "search", "query": "..."}
 {"tool": "fetch", "url": "https://..."}
 {"tool": "answer", "text": "..."}
 
-Plan first: do 1-3 searches to find relevant URLs, then fetch the most useful
-2-4 URLs, then answer. If a fetch returns nothing useful, try a different URL
-or search. Be concise. Stop as soon as you have enough to answer.
+For research questions: 1-3 searches → fetch 2-4 useful URLs → answer.
+Be concise. Don't over-search. Stop as soon as you have enough to answer.
 """
 
 
@@ -145,20 +148,42 @@ async def llm_chat(
     if "openrouter" in base_url:
         headers["HTTP-Referer"] = os.environ.get("APP_URL", "https://coachpixel.com")
         headers["X-Title"] = "Quick Fix Research"
-    r = await client.post(
-        f"{base_url.rstrip('/')}/chat/completions",
-        headers=headers,
-        json={
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 1024,
-        },
-        timeout=120.0,
-    )
-    r.raise_for_status()
-    data = r.json()
-    return data["choices"][0]["message"]["content"]
+
+    # Free Gemma on OpenRouter is routed through Google AI Studio which has
+    # tight per-minute caps (~10 RPM). The agent loop bursts several calls
+    # per question, so we retry on 429 with exponential backoff
+    # (honoring Retry-After when present).
+    delays = [3, 8, 15, 30]  # seconds; ~56s total worst case
+    last_err: Exception | None = None
+    for attempt, delay in enumerate([0] + delays):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            r = await client.post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": 1024,
+                },
+                timeout=120.0,
+            )
+            if r.status_code == 429 and attempt < len(delays):
+                ra = r.headers.get("retry-after")
+                if ra and ra.isdigit():
+                    delays[attempt] = max(int(ra), delays[attempt])
+                last_err = httpx.HTTPStatusError("429", request=r.request, response=r)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            if e.response.status_code != 429 or attempt >= len(delays):
+                raise
+    raise last_err or RuntimeError("LLM unreachable after retries")
 
 
 # ---- Tool-call parsing -------------------------------------------------
