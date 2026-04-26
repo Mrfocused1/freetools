@@ -46,7 +46,16 @@ INDEX_JSON = INDEX_DIR / "font_index.json"
 CHECKPOINT_FILE = INDEX_DIR / "build_checkpoint.json"
 
 # Tunables
-SAMPLE_TEXT = "Hamburgefonts ABCDEFG abcdefg 1234"
+# We embed each font under several text variants so that at query time we can
+# match against whichever variant is most similar to the user's input
+# (lowercase-only? all caps? mixed?). Per-variant similarity is later max'd
+# per-font in main.py, which dramatically improves match quality vs a single
+# fixed sample text.
+SAMPLE_TEXTS = [
+    "Hamburgefonts ABCDEFG abcdefg 1234",  # mixed pangram-like
+    "abcdefghijklmnopqrstuvwxyz",          # full lowercase
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",          # full uppercase
+]
 RENDER_FONT_SIZE = 64
 RENDER_PADDING = 16
 WEIGHT_PREFERENCE = [400, 500, 300, 700, 600, 800, 900, 100, 200]
@@ -93,8 +102,8 @@ def embed_image(img: Image.Image) -> np.ndarray:
 # ---------- Font rendering ------------------------------------------------- #
 
 
-def render_sample(ttf_bytes: bytes) -> Image.Image | None:
-    """Render SAMPLE_TEXT from in-memory TTF bytes. None on failure."""
+def render_sample(ttf_bytes: bytes, sample_text: str) -> Image.Image | None:
+    """Render `sample_text` from in-memory TTF bytes. None on failure."""
     try:
         font = ImageFont.truetype(io.BytesIO(ttf_bytes), size=RENDER_FONT_SIZE)
     except Exception:
@@ -102,7 +111,7 @@ def render_sample(ttf_bytes: bytes) -> Image.Image | None:
     dummy = Image.new("RGB", (1, 1))
     d = ImageDraw.Draw(dummy)
     try:
-        bbox = d.textbbox((0, 0), SAMPLE_TEXT, font=font)
+        bbox = d.textbbox((0, 0), sample_text, font=font)
     except Exception:
         return None
     w = bbox[2] - bbox[0] + RENDER_PADDING * 2
@@ -114,7 +123,7 @@ def render_sample(ttf_bytes: bytes) -> Image.Image | None:
     try:
         draw.text(
             (RENDER_PADDING - bbox[0], RENDER_PADDING - bbox[1]),
-            SAMPLE_TEXT,
+            sample_text,
             font=font,
             fill=(0, 0, 0),
         )
@@ -229,36 +238,46 @@ def main() -> None:
                 failed += 1
                 continue
 
-            img = render_sample(ttf_bytes)
+            # Render + embed for each sample text variant. We store them as
+            # separate entries; main.py groups by `id` and takes the max score
+            # per font at query time, so the best-matching variant wins.
+            font_vecs: list[list[float]] = []
+            font_metas: list[dict] = []
+            for variant_idx, sample_text in enumerate(SAMPLE_TEXTS):
+                img = render_sample(ttf_bytes, sample_text)
+                if img is None:
+                    continue
+                try:
+                    vec = embed_image(img)
+                except Exception as e:
+                    log.warning("[%d/%d] %s variant=%d: embed failed: %s", i, total, fid, variant_idx, e)
+                    continue
+                font_vecs.append(vec.tolist())
+                font_metas.append({
+                    "id": fid,
+                    "family": font.get("family", fid),
+                    "style": style_name(weight, style),
+                    "weight": weight,
+                    "subset": subset,
+                    "variant": variant_idx,
+                    "source": "fontsource",
+                    "category": font.get("category"),
+                    "license": (font.get("license") if isinstance(font.get("license"), str)
+                                else (font.get("license") or {}).get("type") or ""),
+                    "downloadUrl": url,
+                    "previewUrl": url,
+                    "fontsourceUrl": f"https://fontsource.org/fonts/{fid}",
+                })
             del ttf_bytes  # free memory promptly
-            if img is None:
-                log.warning("[%d/%d] %s: render failed", i, total, fid)
+
+            if not font_vecs:
+                log.warning("[%d/%d] %s: all variants failed to render", i, total, fid)
                 failed += 1
                 done_ids.add(fid)
                 continue
 
-            try:
-                vec = embed_image(img)
-            except Exception as e:
-                log.warning("[%d/%d] %s: embed failed: %s", i, total, fid, e)
-                failed += 1
-                continue
-
-            vectors.append(vec.tolist())
-            meta.append({
-                "id": fid,
-                "family": font.get("family", fid),
-                "style": style_name(weight, style),
-                "weight": weight,
-                "subset": subset,
-                "source": "fontsource",
-                "category": font.get("category"),
-                "license": (font.get("license") if isinstance(font.get("license"), str)
-                            else (font.get("license") or {}).get("type") or ""),
-                "downloadUrl": url,
-                "previewUrl": url,
-                "fontsourceUrl": f"https://fontsource.org/fonts/{fid}",
-            })
+            vectors.extend(font_vecs)
+            meta.extend(font_metas)
             done_ids.add(fid)
             success += 1
 

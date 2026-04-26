@@ -252,15 +252,27 @@ async def identify(
             ),
         )
 
-    # Cosine similarity: both query and index vectors are unit-normed at build time.
-    # scores shape: [N]
+    # Cosine similarity over ALL stored variants (each font has 1+ variants).
+    # We then group by (family, style) and take the MAX score per group so
+    # each unique font appears once and is ranked by its best-matching variant.
     scores: np.ndarray = _font_vectors @ query_vec  # dot product = cosine sim
-    top_idx = np.argsort(scores)[::-1][:TOP_K]
+
+    best_by_key: dict[str, tuple[float, int]] = {}
+    for idx in range(len(scores)):
+        meta = _font_meta[idx]
+        # Stable per-font key (id includes the family). Fall back to family+style.
+        key = meta.get("id") or f"{meta.get('family','?')}::{meta.get('style','?')}"
+        s = float(scores[idx])
+        prev = best_by_key.get(key)
+        if prev is None or s > prev[0]:
+            best_by_key[key] = (s, idx)
+
+    # Sort groups by best-variant score, take top-K
+    ranked = sorted(best_by_key.values(), key=lambda x: x[0], reverse=True)[:TOP_K]
 
     matches = []
-    for idx in top_idx:
+    for score, idx in ranked:
         meta = _font_meta[idx]
-        score = float(scores[idx])
         matches.append(
             {
                 "family": meta.get("family", "Unknown"),
