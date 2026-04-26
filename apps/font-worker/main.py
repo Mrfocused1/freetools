@@ -69,6 +69,10 @@ MIN_CHAR_AREA = 20         # ignore blobs smaller than this (noise)
 MAX_CHAR_ASPECT = 8.0      # ignore very wide blobs (likely not single chars)
 GLYPH_CANVAS_SIZE = 80     # square canvas size for individual char crops (matches build_index.py)
 CHAR_PADDING = 4           # px padding around each char bounding box crop
+# Cap how many segmented chars we actually embed. CLIP on CPU is ~200ms each,
+# so without this a long-text upload can take 10+ seconds. We rank segments by
+# area and keep the largest — those are the most reliably-shaped glyphs.
+MAX_CHARS_TO_EMBED = 20
 
 # Voting: for each segmented char, we find its TOP_CHARS_PER_CHAR nearest index
 # entries and add their cosine scores as votes. Using top-N rather than top-1
@@ -251,8 +255,10 @@ def _segment_chars(raw: bytes) -> list[Image.Image]:
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
 
     img_w, img_h = img_pil.size
-    crops: list[Image.Image] = []
 
+    # First pass: collect candidate components with their stats so we can rank
+    # by area and drop the smallest noise (accent dots, "i" tittles, JPEG specks).
+    candidates: list[tuple[int, int, int, int, int]] = []  # (area, x, y, w, h)
     for label in range(1, num_labels):  # skip background (label 0)
         x = int(stats[label, cv2.CC_STAT_LEFT])
         y = int(stats[label, cv2.CC_STAT_TOP])
@@ -265,31 +271,43 @@ def _segment_chars(raw: bytes) -> list[Image.Image]:
         aspect = max(w, h) / max(min(w, h), 1)
         if aspect > MAX_CHAR_ASPECT:
             continue
-        # Discard blobs that are clearly not characters (too small relative to image)
         if h < img_h * 0.05 or w < img_w * 0.005:
             continue
 
-        # Crop with padding
+        candidates.append((area, x, y, w, h))
+
+    # Compute the median area; drop components whose area is < 25% of median.
+    # This filters most accent dots / "i" tittles without losing main glyph
+    # bodies, since dots are typically <15% of letter body area.
+    if len(candidates) >= 4:
+        median_area = float(sorted(c[0] for c in candidates)[len(candidates) // 2])
+        candidates = [c for c in candidates if c[0] >= median_area * 0.25]
+
+    # Sort by area descending and keep at most MAX_CHARS_TO_EMBED. Largest glyphs
+    # are the most reliably-shaped and dominate any voting outcome anyway, so
+    # capping protects latency without meaningful accuracy loss.
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    candidates = candidates[:MAX_CHARS_TO_EMBED]
+
+    crops: list[Image.Image] = []
+    for _, x, y, w, h in candidates:
         x0 = max(0, x - CHAR_PADDING)
         y0 = max(0, y - CHAR_PADDING)
         x1 = min(img_w, x + w + CHAR_PADDING)
         y1 = min(img_h, y + h + CHAR_PADDING)
         char_crop = img_pil.crop((x0, y0, x1, y1))
 
-        # Centre on a square canvas matching the build_index.py format
         cw, ch = char_crop.size
         side = max(cw, ch, GLYPH_CANVAS_SIZE)
         canvas = Image.new("RGB", (side, side), (255, 255, 255))
         canvas.paste(char_crop, ((side - cw) // 2, (side - ch) // 2))
-
         crops.append(canvas)
 
     if len(crops) < 2:
-        # Segmentation failed or image has very few glyphs; fall back to whole image
         log.debug("Character segmentation yielded %d crops; falling back to whole-image.", len(crops))
         return [_preprocess(raw)]
 
-    log.debug("Segmented %d character crops.", len(crops))
+    log.info("Segmented %d character crops (after filter + cap).", len(crops))
     return crops
 
 
@@ -310,7 +328,8 @@ def _search_glyph(char_crops: list[Image.Image]) -> list[tuple[float, int]]:
     # For each character crop, find top-N nearest index entries and add their
     # cosine similarities as votes. The font_id with the highest total vote wins.
     vote_score: dict[str, float] = {}
-    vote_meta_idx: dict[str, int] = {}  # track the best-scoring meta entry per font
+    best_score_per_key: dict[str, float] = {}
+    vote_meta_idx: dict[str, int] = {}  # the meta entry that gave the highest individual score
 
     for crop in char_crops:
         try:
@@ -331,8 +350,11 @@ def _search_glyph(char_crops: list[Image.Image]) -> list[tuple[float, int]]:
             key = meta.get("id") or f"{meta.get('family','?')}::{meta.get('style','?')}"
             score = float(sims[idx])
             vote_score[key] = vote_score.get(key, 0.0) + score
-            # Track the meta entry with the highest individual score for this font
-            if key not in vote_meta_idx or score > float(_font_vectors[vote_meta_idx[key]] @ q):
+            # Track the meta entry that gave the BEST individual cosine for this
+            # font across all crops. (Earlier code re-dot-product'd against the
+            # current crop, which compared apples to oranges.)
+            if score > best_score_per_key.get(key, -1.0):
+                best_score_per_key[key] = score
                 vote_meta_idx[key] = int(idx)
 
     # Normalise vote scores to [0, 1] by dividing by number of char crops so
