@@ -86,9 +86,29 @@ export async function POST(req: NextRequest) {
     });
 
     if (!r.ok) {
-      const detail = await r.text().catch(() => "");
+      const raw = await r.text().catch(() => "");
+      // Try to extract FastAPI's `detail` field for a cleaner message.
+      let inner = raw;
+      try {
+        const parsed = JSON.parse(raw);
+        if (typeof parsed?.detail === "string") inner = parsed.detail;
+      } catch {}
+
+      // Special case: index isn't built yet — show a friendly "coming soon"
+      // message instead of the developer-facing build instructions.
+      if (r.status === 503 && /index is empty/i.test(inner)) {
+        return NextResponse.json(
+          {
+            error:
+              "Font Identifier is still warming up — our font index is being built. Try again in a few hours.",
+            warmingUp: true,
+          },
+          { status: 503 }
+        );
+      }
+
       return NextResponse.json(
-        { error: `Font worker error: ${detail.slice(0, 400) || r.statusText}` },
+        { error: inner.slice(0, 400) || r.statusText },
         { status: r.status === 503 ? 503 : 400 }
       );
     }
