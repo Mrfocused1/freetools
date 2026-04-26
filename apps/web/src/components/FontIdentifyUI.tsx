@@ -20,8 +20,14 @@ type FontMatch = {
 type State =
   | { kind: "idle" }
   | { kind: "loading" }
-  | { kind: "done"; matches: FontMatch[]; imageUrl: string }
+  | { kind: "done"; matches: FontMatch[]; imageUrl: string; imageDataUrl?: string }
   | { kind: "error"; message: string };
+
+type GenState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "done"; ttfUrl?: string; ttfBase64?: string }
+  | { kind: "error"; message: string; offline?: boolean };
 
 const ACCEPTED = ["image/png", "image/jpeg", "image/webp"];
 const MAX_BYTES = 10 * 1024 * 1024;
@@ -147,6 +153,150 @@ function FontCard({ match, rank }: { match: FontMatch; rank: number }) {
 }
 
 // --------------------------------------------------------------------------- //
+// Generate section                                                              //
+// --------------------------------------------------------------------------- //
+
+function GenerateSection({ imageDataUrl }: { imageDataUrl: string }) {
+  const [genState, setGenState] = useState<GenState>({ kind: "idle" });
+
+  const generate = useCallback(async () => {
+    setGenState({ kind: "loading" });
+    try {
+      const r = await fetch("/api/font-clone/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageDataUrl, fontFamily: "CustomFont" }),
+      });
+      const json = (await r.json()) as {
+        ttfUrl?: string;
+        ttfBase64?: string;
+        error?: string;
+        offline?: boolean;
+      };
+      if (!r.ok) {
+        setGenState({
+          kind: "error",
+          message: json.error ?? `HTTP ${r.status}`,
+          offline: json.offline,
+        });
+        return;
+      }
+      setGenState({ kind: "done", ttfUrl: json.ttfUrl, ttfBase64: json.ttfBase64 });
+    } catch (e) {
+      setGenState({
+        kind: "error",
+        message: e instanceof Error ? e.message : "Request failed",
+      });
+    }
+  }, [imageDataUrl]);
+
+  const downloadBase64 = useCallback((b64: string) => {
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const blob = new Blob([bytes], { type: "font/ttf" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "CustomFont.ttf";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }, []);
+
+  return (
+    <div className="rounded-2xl border border-dashed border-[var(--color-border)] bg-[var(--color-surface)] p-5">
+      <p className="text-sm font-medium">No good match? Generate a custom font</p>
+      <p className="mt-1 text-xs text-[var(--color-muted)]">
+        Early access — we extract glyphs from your image and assemble a starter TTF file.
+        Quality depends on image clarity. Refine the result in Glyphs or FontForge for
+        production use.
+      </p>
+
+      {genState.kind === "idle" && (
+        <button
+          type="button"
+          onClick={() => void generate()}
+          className="mt-4 inline-flex items-center gap-2 rounded-md bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-white hover:opacity-90"
+        >
+          Generate custom font
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+            <path d="M12 2L2 7l10 5 10-5-10-5z" />
+            <path d="M2 17l10 5 10-5" />
+            <path d="M2 12l10 5 10-5" />
+          </svg>
+        </button>
+      )}
+
+      {genState.kind === "loading" && (
+        <div className="mt-4 space-y-1">
+          <p className="text-xs text-[var(--color-muted)]">
+            Generating your font — this takes 1–3 minutes on the GPU worker…
+          </p>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-border)]">
+            <div className="h-full w-1/2 animate-pulse rounded-full bg-[var(--color-accent)]" />
+          </div>
+        </div>
+      )}
+
+      {genState.kind === "done" && (
+        <div className="mt-4 space-y-3">
+          <p className="text-sm text-green-600 dark:text-green-400">
+            Your font is ready. Download it and install on your system.
+          </p>
+          {genState.ttfUrl && (
+            <a
+              href={genState.ttfUrl}
+              download="CustomFont.ttf"
+              className="inline-flex items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-4 py-1.5 text-sm font-medium text-white hover:opacity-90"
+            >
+              Download TTF
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="M12 5v14M5 12l7 7 7-7" />
+              </svg>
+            </a>
+          )}
+          {genState.ttfBase64 && !genState.ttfUrl && (
+            <button
+              type="button"
+              onClick={() => downloadBase64(genState.ttfBase64!)}
+              className="inline-flex items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-4 py-1.5 text-sm font-medium text-white hover:opacity-90"
+            >
+              Download TTF
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="M12 5v14M5 12l7 7 7-7" />
+              </svg>
+            </button>
+          )}
+          <p className="text-xs text-[var(--color-muted)]">
+            Tip: open the TTF in FontForge or Glyphs to clean up curves and add kerning.
+          </p>
+        </div>
+      )}
+
+      {genState.kind === "error" && (
+        <div className="mt-4 space-y-3">
+          {genState.offline ? (
+            <p className="text-sm text-[var(--color-muted)]">
+              Custom font generation is currently offline — the GPU worker is not provisioned.
+              Check back soon, or try identifying a matching font above.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-red-500">{genState.message}</p>
+              <button
+                type="button"
+                onClick={() => setGenState({ kind: "idle" })}
+                className="rounded-md border border-[var(--color-border)] px-3 py-1 text-xs hover:border-[var(--color-accent)]"
+              >
+                Try again
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --------------------------------------------------------------------------- //
 // Main UI                                                                       //
 // --------------------------------------------------------------------------- //
 
@@ -169,6 +319,15 @@ export function FontIdentifyUI() {
     const imageUrl = URL.createObjectURL(file);
     setState({ kind: "loading" });
 
+    // Read as data URL so we can pass it to the generate endpoint later
+    // without the user having to re-upload.
+    const imageDataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+
     const body = new FormData();
     body.append("file", file);
 
@@ -182,7 +341,7 @@ export function FontIdentifyUI() {
         throw new Error(err.error ?? `HTTP ${r.status}`);
       }
       const json = (await r.json()) as { matches: FontMatch[] };
-      setState({ kind: "done", matches: json.matches ?? [], imageUrl });
+      setState({ kind: "done", matches: json.matches ?? [], imageUrl, imageDataUrl });
     } catch (e) {
       URL.revokeObjectURL(imageUrl);
       const msg = e instanceof Error ? e.message : "Request failed";
@@ -305,6 +464,11 @@ export function FontIdentifyUI() {
                 <FontCard key={`${m.family}-${m.style}-${i}`} match={m} rank={i + 1} />
               ))}
             </>
+          )}
+
+          {/* Generate custom font (Phase 2) */}
+          {state.imageDataUrl && (
+            <GenerateSection imageDataUrl={state.imageDataUrl} />
           )}
 
           {/* Try another */}

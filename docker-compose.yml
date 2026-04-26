@@ -16,6 +16,11 @@ services:
       # Used by /api/font-clone/identify to call the font-worker.
       - FONT_WORKER_URL=http://font-worker:8000
       - FONT_TOKEN=${FONT_TOKEN}
+      # Used by /api/font-clone/generate to call the vast.ai font-gen GPU worker.
+      # Set after running tools/font-gen/scripts/font-gen-up.sh.
+      # Leave blank when the GPU worker is not provisioned (returns 503 offline).
+      - FONT_GEN_URL=${FONT_GEN_URL:-}
+      - FONT_GEN_TOKEN=${FONT_GEN_TOKEN:-}
     depends_on:
       - redis
       - worker
